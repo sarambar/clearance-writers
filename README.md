@@ -137,6 +137,34 @@ A name collision between the read and the PUT, a rule that outlives its TTL beca
 | 10 | Authorization checks require `AuthorizationFailed` or `LinkedAuthorizationFailed`. `BadGateway` and an empty list do not pass. |
 | 11 | Role-definition delete is not performed here. The recorded az shape requires `--name` and `--scope`. An id-only firewall delete is rejected by the fake. |
 
+## Live smoke
+
+This is a manual run on a machine that already has `az login`. It is not part of CI. The script exits immediately when `CI` or `GITHUB_ACTIONS` is set. It does not create a service principal, and it does not write a password or an access token to disk.
+
+It creates one resource group, `rg-clearance-smoke-<random>`, tagged `purpose=clearance-smoke` and `created-by=live-smoke`. Inside that group:
+
+- An Azure SQL logical server with Microsoft Entra-only authentication. The signed-in user is the Entra admin. No SQL password is set, and no database is created, so there is no SQL compute SKU.
+- An Azure Database for PostgreSQL Flexible Server, Burstable `Standard_B1ms`, 32 GiB (the minimum), public network access on, and password authentication disabled. The signed-in user is the Entra admin. No password is generated or printed.
+
+B1ms is the smallest flexible-server SKU. The cost of a run is that server for as long as it exists, plus the time to provision it. Provisioning is usually 10–20 minutes, most of it the PostgreSQL server. The script deletes the group on exit, including after an error or Ctrl-C. If the group is left behind, the flexible server keeps billing until the group is deleted.
+
+A `trap` runs `az group delete --yes --no-wait` and then checks that the group is gone or deleting. The script prints the same manual command before it creates anything:
+
+```bash
+az login
+SUBSCRIPTION_ID="<subscription-guid>" scripts/live-smoke.sh
+```
+
+`LOCATION` defaults to `centralus`. The script refuses to run when the active `az` subscription is different from `SUBSCRIPTION_ID`. It reads the runner's public IPv4 from `https://api.ipify.org` and asks the writers to allow that one host, then remove it. A foreign rule named `office-vpn` is created with `az` and must still be there at the end. Output is a PASS/FAIL table and the audit events' package version and commit SHA.
+
+Requires Node.js 22, Azure CLI, curl, openssl, and git. From the repo after `npm ci`:
+
+```bash
+SUBSCRIPTION_ID="<subscription-guid>" LOCATION=centralus scripts/live-smoke.sh
+```
+
+`zsh scripts/live-smoke.sh` runs the same script. If teardown does not finish, use the `az group delete --name rg-clearance-smoke-... --subscription <subscription-guid> --yes --no-wait` line the script printed.
+
 ## Development
 
 Node.js 22 or newer. No runtime dependencies. ARM is called with `fetch`.
