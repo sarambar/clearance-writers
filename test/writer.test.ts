@@ -13,6 +13,7 @@ import {
 } from "../src/azure/profiles.js";
 import {
   InMemoryFirewallWriter,
+  PUBLIC_ACCESS_DISABLED_MESSAGE,
   SQL_RULE_CAP,
   type FirewallWriter,
 } from "../src/index.js";
@@ -143,6 +144,36 @@ describe("azure sql writer", () => {
     assert.equal(removed.ok, true);
     assert.equal(fake.rulesFor(SQL_ID)?.some((rule) => rule.name === RULE), false);
   });
+
+  it("maps DenyPublicEndpointEnabled to public_access_disabled and does not enable public access", async () => {
+    const { fake, writer, resourceId } = harness("sql");
+    // REST Firewall Rules - Create Or Update, HTTP 400.
+    // https://learn.microsoft.com/en-us/rest/api/sql/firewall-rules/create-or-update?view=rest-sql-2021-11-01
+    fake.failMatching(
+      { method: "PUT", pathIncludes: "/firewallRules/" },
+      {
+        status: 400,
+        code: "DenyPublicEndpointEnabled",
+        message:
+          "Unable to create or modify firewall rules when public network interface for the server is disabled. To manage server or database level firewall rules, please enable the public network interface.",
+      },
+    );
+    const result = await writer.addRule(addRequest(resourceId));
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.error.code, "public_access_disabled");
+      assert.equal(result.error.cloudCode, "DenyPublicEndpointEnabled");
+      assert.equal(result.error.cloudStatus, 400);
+      assert.equal(result.error.message, PUBLIC_ACCESS_DISABLED_MESSAGE);
+      assert.equal(result.error.authorizationDenial, false);
+      assert.equal(
+        result.audit.some((event) => event.phase === "result" && event.outcome === "failed" && event.detailCode === "public_access_disabled"),
+        true,
+      );
+    }
+    assert.equal(fake.rulesFor(resourceId)?.length, 0);
+    assert.equal(methods(fake).some((line) => !line.startsWith("GET ") && !line.toLowerCase().includes("/firewallrules/")), false);
+  });
 });
 
 describe("azure postgres writer", () => {
@@ -177,8 +208,54 @@ describe("azure postgres writer", () => {
     assert.equal(result.ok, false);
     if (!result.ok) {
       assert.equal(result.error.code, "public_access_disabled");
+      assert.equal(result.error.message, PUBLIC_ACCESS_DISABLED_MESSAGE);
     }
     assert.equal(fake.requests.some((request) => request.method === "PUT"), false);
+  });
+
+  it("maps the documented private-access message and does not enable public access", async () => {
+    const { fake, writer, resourceId } = harness("pg");
+    // Learn documents this sentence and no error code.
+    // https://learn.microsoft.com/en-us/azure/postgresql/network/how-to-networking-servers-deployed-public-access-add-firewall-rules
+    fake.failMatching(
+      { method: "PUT", pathIncludes: "/firewallRules/" },
+      {
+        status: 400,
+        code: null,
+        message: "Firewall rule operations cannot be requested for a private access enabled server.",
+      },
+    );
+    const result = await writer.addRule(addRequest(resourceId));
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.error.code, "public_access_disabled");
+      assert.equal(result.error.cloudCode, null);
+      assert.equal(result.error.message, PUBLIC_ACCESS_DISABLED_MESSAGE);
+      assert.equal(result.audit.some((event) => event.phase === "result" && event.outcome === "failed" && event.detailCode === "public_access_disabled"), true);
+    }
+    assert.equal(fake.rulesFor(resourceId)?.length, 0);
+    assert.equal(methods(fake).some((line) => !line.startsWith("GET ") && !line.toLowerCase().includes("/firewallrules/")), false);
+  });
+
+  it("maps the az validator sentence when it arrives in an error body", async () => {
+    const { fake, writer, resourceId } = harness("pg");
+    // azure-cli postgresql/utils/validators.py validate_public_access_server.
+    // This is client-side, before ARM. Mapped only if that text is in the error body.
+    fake.failMatching(
+      { method: "PUT", pathIncludes: "/firewallRules/" },
+      {
+        status: 400,
+        code: null,
+        message: "Firewall rule operations are not supported for a server without public access enabled.",
+      },
+    );
+    const result = await writer.addRule(addRequest(resourceId));
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.error.code, "public_access_disabled");
+      assert.equal(result.error.message, PUBLIC_ACCESS_DISABLED_MESSAGE);
+    }
+    assert.equal(fake.rulesFor(resourceId)?.length, 0);
   });
 });
 

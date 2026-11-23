@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { escapeForOutput } from "../codec.js";
-import { writerError, type WriterError } from "../errors.js";
+import { PUBLIC_ACCESS_DISABLED_MESSAGE, writerError, type WriterError } from "../errors.js";
 import { headerValue, sameOriginArmUrl, type ArmTokenProvider, type HttpTransport } from "./http.js";
 
 /** azure-core's default polling interval when Retry-After is absent. */
@@ -140,15 +140,18 @@ export class ArmClient {
       delay = retryAfterMs(status.headers) ?? LRO_DEFAULT_DELAY_MS;
       if (state === "failed") {
         const cloud = readError(status.body);
+        const closed = publicAccessDisabledError(status.status, cloud);
         return {
           ok: false,
           requestId: status.requestId,
-          error: writerError({
-            code: "lro_failed",
-            message: escapeForOutput(cloud?.message ?? "The long-running operation failed."),
-            cloudCode: safeCloudCode(cloud?.code ?? null),
-            cloudStatus: status.status,
-          }),
+          error:
+            closed ??
+            writerError({
+              code: "lro_failed",
+              message: escapeForOutput(cloud?.message ?? "The long-running operation failed."),
+              cloudCode: safeCloudCode(cloud?.code ?? null),
+              cloudStatus: status.status,
+            }),
         };
       }
       if (state === "canceled") {
@@ -404,11 +407,10 @@ function readError(body: unknown): { code: string; message: string } | null {
   const nested = record.error;
   if (nested !== null && typeof nested === "object") {
     const error = nested as Record<string, unknown>;
-    if (typeof error.code === "string") {
-      return {
-        code: error.code,
-        message: typeof error.message === "string" ? error.message : error.code,
-      };
+    const code = typeof error.code === "string" ? error.code : "";
+    const message = typeof error.message === "string" ? error.message : "";
+    if (code !== "" || message !== "") {
+      return { code, message: message !== "" ? message : code };
     }
   }
   if (typeof record.code === "string") {
@@ -463,6 +465,48 @@ function lroState(body: unknown): LroKind {
   return "unknown";
 }
 
+/**
+ * ARM rejects firewall writes when the server is not open to the public endpoint.
+ * SQL publishes code DenyPublicEndpointEnabled:
+ * https://learn.microsoft.com/en-us/rest/api/sql/firewall-rules/create-or-update?view=rest-sql-2021-11-01
+ * The same sentence is Error 42101 in the connectivity docs (data plane).
+ * PostgreSQL publishes the message and no code:
+ * https://learn.microsoft.com/en-us/azure/postgresql/network/how-to-networking-servers-deployed-public-access-add-firewall-rules
+ * az postgres flexible-server firewall-rule also raises, before ARM, when
+ * network.publicNetworkAccess is Disabled (azure-cli postgresql/utils/validators.py
+ * validate_public_access_server). That text is mapped if it arrives in an error body.
+ * This function does not enable public access.
+ */
+function publicAccessDisabledError(
+  status: number,
+  cloud: { code: string; message: string } | null,
+): WriterError | null {
+  if (cloud === null || !publicAccessDisabled(cloud.code, cloud.message)) {
+    return null;
+  }
+  const cloudCode = cloud.code === "" ? null : safeCloudCode(cloud.code);
+  return writerError({
+    code: "public_access_disabled",
+    message: PUBLIC_ACCESS_DISABLED_MESSAGE,
+    cloudCode,
+    cloudStatus: status,
+    authorizationDenial: false,
+    retryable: false,
+  });
+}
+
+function publicAccessDisabled(code: string, message: string): boolean {
+  if (code === "DenyPublicEndpointEnabled") {
+    return true;
+  }
+  const text = message.toLowerCase();
+  return (
+    text.includes("unable to create or modify firewall rules when public network interface") ||
+    text.includes("firewall rule operations cannot be requested for a private access enabled server") ||
+    text.includes("firewall rule operations are not supported for a server without public access enabled")
+  );
+}
+
 function safeCloudCode(code: string | null): string | null {
   if (code === null) {
     return null;
@@ -475,6 +519,10 @@ function classifyFailure(
   cloud: { code: string; message: string } | null,
   token: string,
 ): WriterError {
+  const closed = publicAccessDisabledError(status, cloud);
+  if (closed !== null) {
+    return closed;
+  }
   const code = safeCloudCode(cloud?.code ?? null);
   const message = redact(cloud?.message ?? `ARM returned HTTP ${status}.`, token);
   if (code !== null && ARM_AUTHORIZATION_DENIAL.has(code)) {

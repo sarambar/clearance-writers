@@ -52,7 +52,7 @@ interface FailureRule {
   method?: string;
   pathIncludes?: string;
   status: number;
-  code: string;
+  code: string | null;
   message: string;
   remaining: number;
 }
@@ -109,14 +109,14 @@ export class FakeArm implements HttpTransport {
   /** Subsequent matching calls return this ARM error and do not mutate. */
   failMatching(
     match: { method?: string; pathIncludes?: string },
-    error: { status: number; code: string; message: string },
+    error: { status: number; code?: string | null; message: string },
     times = Number.POSITIVE_INFINITY,
   ): void {
     this.failures.push({
       method: match.method,
       pathIncludes: match.pathIncludes,
       status: error.status,
-      code: error.code,
+      code: error.code ?? null,
       message: error.message,
       remaining: times,
     });
@@ -531,18 +531,18 @@ function readAddresses(
 }
 
 function privateAccessError(server: StoredServer): HttpResponse {
+  // SQL: REST Firewall Rules - Create Or Update, 400 DenyPublicEndpointEnabled.
+  // https://learn.microsoft.com/en-us/rest/api/sql/firewall-rules/create-or-update?view=rest-sql-2021-11-01
   if (server.profile.id === AZURE_SQL_FIREWALL_PROFILE.id) {
     return armError(
       400,
       "DenyPublicEndpointEnabled",
-      "Unable to create or modify firewall rules when public network interface for the server is disabled.",
+      "Unable to create or modify firewall rules when public network interface for the server is disabled. To manage server or database level firewall rules, please enable the public network interface.",
     );
   }
-  return armError(
-    400,
-    "FeatureNotSupported",
-    "Firewall rule operations cannot be requested for a private access enabled server.",
-  );
+  // PostgreSQL Flexible Server publishes this message and no error code.
+  // https://learn.microsoft.com/en-us/azure/postgresql/network/how-to-networking-servers-deployed-public-access-add-firewall-rules
+  return armError(400, null, "Firewall rule operations cannot be requested for a private access enabled server.");
 }
 
 function ruleResource(server: StoredServer, rule: FakeRule): unknown {
@@ -648,6 +648,10 @@ function json(status: number, body: unknown): HttpResponse {
   };
 }
 
-function armError(status: number, code: string, message: string): HttpResponse {
-  return json(status, { error: { code, message } });
+function armError(status: number, code: string | null, message: string): HttpResponse {
+  const error: Record<string, string> = { message };
+  if (code !== null && code !== "") {
+    error.code = code;
+  }
+  return json(status, { error });
 }

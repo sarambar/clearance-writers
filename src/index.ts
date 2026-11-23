@@ -13,7 +13,7 @@ export type { AuditEvent, AuditEventBody, AuditOperation, AuditOutcome, AuditPha
 
 export { canonicalJson, escapeForOutput, sha256Hex } from "./codec.js";
 
-export { WRITER_ERROR_CODES, WriterError, writerError } from "./errors.js";
+export { PUBLIC_ACCESS_DISABLED_MESSAGE, WRITER_ERROR_CODES, WriterError, writerError } from "./errors.js";
 export type { WriterErrorCode } from "./errors.js";
 
 export {

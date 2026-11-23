@@ -66,7 +66,7 @@ The SDK treats a non-202 create response as an error. This package also accepts 
 
 CLI flags: `--resource-group`/`-g`, `--server-name`/`-s`, `--name`/`-n`, `--start-ip-address`, `--end-ip-address`. `-n` is the rule, not the server. MySQL Flexible Server is different again (`--name` is the server, `--rule-name` is the rule) and is not implemented.
 
-No firewall-rule cap is documented for PostgreSQL Flexible Server here, and none is invented. A private-access server is refused when the parent read says public network access is disabled or a delegated subnet is set. Official docs describe up to a five-minute propagation window.
+No firewall-rule cap is documented for PostgreSQL Flexible Server here, and none is invented. A server with public network access disabled, or a delegated subnet, is refused with `public_access_disabled`. The same code is used when ARM returns SQL `DenyPublicEndpointEnabled` or the PostgreSQL message that firewall rules cannot be requested for a private-access server. The writers do not enable public access. Official docs describe up to a five-minute propagation window.
 
 Creating a rule whose name already exists updates that rule in place on Azure. This package reads first and refuses when the stored address or the stored name casing differs. There is no `If-Match` on these resources. A rule created by someone else in the gap between the read and the PUT can still be overwritten. Unguessable names are the mitigation. That race is a residual, and it is untested live.
 
@@ -136,6 +136,34 @@ A name collision between the read and the PUT, a rule that outlives its TTL beca
 | 9 | Failures are `WriterError` values with an operator line. They are not mixed into a success value. |
 | 10 | Authorization checks require `AuthorizationFailed` or `LinkedAuthorizationFailed`. `BadGateway` and an empty list do not pass. |
 | 11 | Role-definition delete is not performed here. The recorded az shape requires `--name` and `--scope`. An id-only firewall delete is rejected by the fake. |
+
+## Live smoke
+
+This is a manual run on a machine that already has `az login`. It is not part of CI. The script exits immediately when `CI` or `GITHUB_ACTIONS` is set. It does not create a service principal, and it does not write a password or an access token to disk.
+
+It creates one resource group, `rg-clearance-smoke-<random>`, tagged `purpose=clearance-smoke` and `created-by=live-smoke`. Inside that group:
+
+- An Azure SQL logical server with Microsoft Entra-only authentication and public network access enabled. The signed-in user is the Entra admin. No SQL password is set, and no database is created, so there is no SQL compute SKU. Create passes `--enable-public-network true`. The script then runs `az sql server update --enable-public-network true`, prints `publicNetworkAccess`, and stops before any firewall rule if the value is not `Enabled`.
+- An Azure Database for PostgreSQL Flexible Server, Burstable `Standard_B1ms`, 32 GiB (the minimum), public network access on, and password authentication disabled. The signed-in user is the Entra admin. No password is generated or printed. Create uses `--public-access Enabled`. In current Azure CLI, `None` sets public network access to Disabled and adds no rule, so firewall commands are rejected. `Enabled` turns public access on and does not add a client-IP or allow-all rule. The script updates with the same flag, prints `network.publicNetworkAccess`, and stops before any firewall rule if the value is not `Enabled`.
+
+B1ms is the smallest flexible-server SKU. The cost of a run is that server for as long as it exists, plus the time to provision it. Provisioning is usually 10–20 minutes, most of it the PostgreSQL server. The script deletes the group on exit, including after an error or Ctrl-C. If the group is left behind, the flexible server keeps billing until the group is deleted.
+
+A `trap` runs `az group delete --yes --no-wait` and then checks that the group is gone or deleting. The script prints the same manual command before it creates anything:
+
+```bash
+az login
+SUBSCRIPTION_ID="<subscription-guid>" scripts/live-smoke.sh
+```
+
+`LOCATION` defaults to `centralus`. The script refuses to run when the active `az` subscription is different from `SUBSCRIPTION_ID`. It reads the runner's public IPv4 from `https://api.ipify.org` and asks the writers to allow that one host, then remove it. A foreign rule named `office-vpn` is created with `az` and must still be there at the end. Output is a PASS/FAIL table and the audit events' package version and commit SHA.
+
+Requires Node.js 22, Azure CLI, curl, openssl, and git. From the repo after `npm ci`:
+
+```bash
+SUBSCRIPTION_ID="<subscription-guid>" LOCATION=centralus scripts/live-smoke.sh
+```
+
+`zsh scripts/live-smoke.sh` runs the same script. If teardown does not finish, use the `az group delete --name rg-clearance-smoke-... --subscription <subscription-guid> --yes --no-wait` line the script printed.
 
 ## Development
 
