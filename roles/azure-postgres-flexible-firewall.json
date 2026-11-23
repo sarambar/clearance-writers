@@ -1,0 +1,17 @@
+{
+  "Name": "Sarambar Clearance PostgreSQL Firewall",
+  "IsCustom": true,
+  "Description": "Create and delete Azure Database for PostgreSQL Flexible Server firewall rules only. No data-plane access. flexibleServers/read returns administratorLogin, not the password. Do not grant flexibleServers/write. Assign at one server or its resource group and narrow AssignableScopes to that group before creating the definition.",
+  "Actions": [
+    "Microsoft.DBforPostgreSQL/flexibleServers/read",
+    "Microsoft.DBforPostgreSQL/flexibleServers/firewallRules/read",
+    "Microsoft.DBforPostgreSQL/flexibleServers/firewallRules/write",
+    "Microsoft.DBforPostgreSQL/flexibleServers/firewallRules/delete"
+  ],
+  "NotActions": [],
+  "DataActions": [],
+  "NotDataActions": [],
+  "AssignableScopes": [
+    "/subscriptions/{subscriptionId}"
+  ]
+}
