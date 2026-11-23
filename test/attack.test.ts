@@ -6,7 +6,8 @@ import { describe, it } from "node:test";
 
 import type { HttpRequest, HttpResponse, HttpTransport } from "../src/azure/http.js";
 import type { AddRuleRequest } from "../src/index.js";
-import { IP, SQL_ID, TOKEN, addRequest, harness } from "./helpers.js";
+import { STRICT_IP_POLICY } from "../src/index.js";
+import { IP, SQL_ID, TOKEN, TEST_IP_POLICY, addRequest, harness } from "./helpers.js";
 
 function hostileAdd(overrides: Record<string, unknown>): AddRuleRequest {
   return { ...addRequest(SQL_ID), ...overrides } as AddRuleRequest;
@@ -85,6 +86,62 @@ describe("hostile input", () => {
     });
   }
 
+  it("rejects RFC 5737 documentation ranges under the default policy", async () => {
+    const addresses = ["192.0.2.1", "192.0.2.0", "198.51.100.20", "203.0.113.10", "203.0.113.255"];
+    for (const ipv4 of addresses) {
+      const { fake, writer, resourceId } = harness("sql");
+      const result = await writer.addRule(
+        addRequest(resourceId, { ipv4, ipPolicy: STRICT_IP_POLICY }),
+      );
+      assert.equal(result.ok, false, ipv4);
+      if (!result.ok) {
+        assert.equal(result.error.code, "not_public_unicast", ipv4);
+      }
+      assert.equal(fake.requests.length, 0, ipv4);
+    }
+    const { fake, writer, resourceId } = harness("sql");
+    const wholeBlock = await writer.addRule(
+      addRequest(resourceId, {
+        ipv4: "203.0.113.0/24",
+        ipPolicy: { ...STRICT_IP_POLICY, minimumPrefixLength: 24 },
+      }),
+    );
+    assert.equal(wholeBlock.ok, false);
+    if (!wholeBlock.ok) {
+      assert.equal(wholeBlock.error.code, "not_public_unicast");
+    }
+    assert.equal(fake.requests.length, 0);
+  });
+
+  it("rejects a documentation range when allowDocumentationRanges is not boolean true", async () => {
+    const { fake, writer, resourceId } = harness("sql");
+    const result = await writer.addRule(
+      addRequest(resourceId, {
+        ipv4: "203.0.113.10",
+        ipPolicy: {
+          ...STRICT_IP_POLICY,
+          allowDocumentationRanges: "true" as unknown as boolean,
+        },
+      }),
+    );
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.error.code, "invalid_input");
+    }
+    assert.equal(fake.requests.length, 0);
+  });
+
+  it("allows a documentation address only when allowDocumentationRanges is true", async () => {
+    const { fake, writer, resourceId } = harness("sql");
+    const refused = await writer.addRule(addRequest(resourceId, { ipPolicy: STRICT_IP_POLICY }));
+    assert.equal(refused.ok, false);
+    const allowed = await writer.addRule(addRequest(resourceId, { ipPolicy: TEST_IP_POLICY }));
+    assert.equal(allowed.ok, true);
+    const put = fake.requests.find((request) => request.method === "PUT");
+    assert.match(put?.body ?? "", /"startIpAddress":"203.0.113.10"/);
+    assert.match(put?.body ?? "", /"endIpAddress":"203.0.113.10"/);
+  });
+
   it("sends 0.0.0.0 only when the policy explicitly allows the Azure services rule", async () => {
     const { fake, writer, resourceId } = harness("sql");
     const allowed = await writer.addRule(
@@ -95,6 +152,7 @@ describe("hostile input", () => {
           allowNonPublic: false,
           allowAzureServicesRule: true,
           allowDefaultRoute: false,
+          allowDocumentationRanges: false,
         },
       }),
     );
@@ -114,6 +172,7 @@ describe("hostile input", () => {
           allowNonPublic: false,
           allowAzureServicesRule: false,
           allowDefaultRoute: "false" as unknown as boolean,
+          allowDocumentationRanges: false,
         },
       }),
     );

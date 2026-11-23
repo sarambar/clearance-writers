@@ -6,8 +6,8 @@ import { writerError, type WriterError } from "./errors.js";
 
 /**
  * Default Clearance address policy: one public IPv4 host.
- * RFC 5737 documentation ranges are accepted so this public repository
- * can use 192.0.2.0/24, 198.51.100.0/24, and 203.0.113.0/24 and no others.
+ * RFC 5737 documentation ranges (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24)
+ * are refused. Tests set allowDocumentationRanges to true. Production must not.
  * 0.0.0.0 (Allow Azure services) and 0.0.0.0/0 stay refused unless the
  * matching flag on the policy is set.
  */
@@ -19,6 +19,11 @@ export interface IpPolicy {
   allowAzureServicesRule: boolean;
   /** 0.0.0.0/0 only. Does not allow any other reserved range. */
   allowDefaultRoute: boolean;
+  /**
+   * Test-only. When true, a range that sits entirely inside one RFC 5737
+   * documentation block is accepted. The default policy sets this false.
+   */
+  allowDocumentationRanges: boolean;
 }
 
 export const STRICT_IP_POLICY: IpPolicy = {
@@ -26,6 +31,7 @@ export const STRICT_IP_POLICY: IpPolicy = {
   allowNonPublic: false,
   allowAzureServicesRule: false,
   allowDefaultRoute: false,
+  allowDocumentationRanges: false,
 };
 
 export const MIN_TTL_SECONDS = 1;
@@ -128,12 +134,21 @@ function invalid(code: WriterError["code"], message: string): WriterError {
   return writerError({ code, message });
 }
 
-function readPolicyFlags(
-  policy: IpPolicy,
-): { ok: true; value: { allowNonPublic: boolean; allowAzureServicesRule: boolean; allowDefaultRoute: boolean } } | { ok: false; error: WriterError } {
+function readPolicyFlags(policy: IpPolicy):
+  | {
+      ok: true;
+      value: {
+        allowNonPublic: boolean;
+        allowAzureServicesRule: boolean;
+        allowDefaultRoute: boolean;
+        allowDocumentationRanges: boolean;
+      };
+    }
+  | { ok: false; error: WriterError } {
   const allowNonPublic = booleanFlag(policy.allowNonPublic, "allowNonPublic");
   const allowAzureServicesRule = booleanFlag(policy.allowAzureServicesRule, "allowAzureServicesRule");
   const allowDefaultRoute = booleanFlag(policy.allowDefaultRoute, "allowDefaultRoute");
+  const allowDocumentationRanges = booleanFlag(policy.allowDocumentationRanges, "allowDocumentationRanges");
   if (!allowNonPublic.ok) {
     return allowNonPublic;
   }
@@ -143,12 +158,16 @@ function readPolicyFlags(
   if (!allowDefaultRoute.ok) {
     return allowDefaultRoute;
   }
+  if (!allowDocumentationRanges.ok) {
+    return allowDocumentationRanges;
+  }
   return {
     ok: true,
     value: {
       allowNonPublic: allowNonPublic.value,
       allowAzureServicesRule: allowAzureServicesRule.value,
       allowDefaultRoute: allowDefaultRoute.value,
+      allowDocumentationRanges: allowDocumentationRanges.value,
     },
   };
 }
@@ -281,8 +300,17 @@ export function parseAllowAddress(
         error: invalid("default_route_forbidden", "0.0.0.0/0 is refused."),
       };
     }
-  } else if (DOCUMENTATION.some((item) => contains(item, range))) {
-    // RFC 5737 documentation ranges are the only non-routable hosts this repo accepts.
+  } else if (DOCUMENTATION.some((item) => overlaps(range, item))) {
+    const entirelyInside = DOCUMENTATION.some((item) => contains(item, range));
+    if (!flags.value.allowDocumentationRanges || !entirelyInside) {
+      return {
+        ok: false,
+        error: invalid(
+          "not_public_unicast",
+          "RFC 5737 documentation addresses are refused unless allowDocumentationRanges is true.",
+        ),
+      };
+    }
   } else if (overlaps(range, MULTICAST_AND_RESERVED)) {
     return {
       ok: false,

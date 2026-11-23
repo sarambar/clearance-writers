@@ -72,7 +72,7 @@ Creating a rule whose name already exists updates that rule in place on Azure. T
 
 ## Address, name, and TTL rules
 
-The default policy accepts one public IPv4 host. RFC 5737 documentation ranges (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`) are accepted so this public repository can use example addresses. Everything else non-public is refused: private, loopback, link-local, shared address space, multicast, and the reserved block.
+The default policy accepts one public IPv4 host. RFC 5737 documentation ranges (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`) are refused, the same as other non-public space: private, loopback, link-local, shared address space, multicast, and the reserved block. Tests that need a placeholder address set `allowDocumentationRanges` to `true`. A string or any other non-boolean does not turn the flag on. Production callers leave it false.
 
 `0.0.0.0` (Allow Azure services, including other customers) and `0.0.0.0/0` are refused unless the caller passes an explicit policy that turns on `allowAzureServicesRule` or `allowDefaultRoute`. The Clearance default does not. Hyphen ranges are refused. IPv6 is refused. The adapter writes Azure `startIpAddress` and `endIpAddress`. For one host they are equal.
 

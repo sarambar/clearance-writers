@@ -4,10 +4,12 @@
 import { FakeArm, type FakeServerSeed } from "../src/azure/fake-arm.js";
 import {
   MemoryAuditSink,
+  STRICT_IP_POLICY,
   createAzurePostgresFirewallWriter,
   createAzureSqlFirewallWriter,
   type AddRuleRequest,
   type FirewallWriter,
+  type IpPolicy,
 } from "../src/index.js";
 
 export const SUBSCRIPTION = "00000000-0000-0000-0000-000000000000";
@@ -21,6 +23,15 @@ export const OTHER_IP = "203.0.113.11";
 export const FOREIGN_IP = "198.51.100.20";
 export const NOW = new Date("2026-01-01T00:00:00.000Z");
 
+/**
+ * Test-only address policy. Production code uses STRICT_IP_POLICY, which
+ * rejects RFC 5737 documentation ranges.
+ */
+export const TEST_IP_POLICY: IpPolicy = {
+  ...STRICT_IP_POLICY,
+  allowDocumentationRanges: true,
+};
+
 export function addRequest(resourceId: string, overrides: Partial<AddRuleRequest> = {}): AddRuleRequest {
   return {
     resourceId,
@@ -28,6 +39,7 @@ export function addRequest(resourceId: string, overrides: Partial<AddRuleRequest
     ipv4: IP,
     ttlSeconds: 60,
     ledgerOwned: true,
+    ipPolicy: TEST_IP_POLICY,
     ...overrides,
   };
 }
