@@ -62,6 +62,11 @@ describe("live smoke guards", () => {
     assert.match(script, /enable-ad-only-auth/);
     assert.match(script, /password-auth Disabled/);
     assert.match(script, /Standard_B1ms/);
+    assert.match(script, /--enable-public-network true/);
+    assert.match(script, /--public-access Enabled/);
+    assert.match(script, /SQL publicNetworkAccess/);
+    assert.match(script, /PostgreSQL publicNetworkAccess/);
+    assert.equal(script.includes("--public-access None"), false);
     assert.equal(script.includes("--admin-password"), false);
     assert.equal(script.includes("client-secret"), false);
     assert.match(script, /live-smoke refuses to run in CI/);

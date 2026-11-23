@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { buildAuditEvent, type AuditEvent, type AuditOperation, type AuditOutcome, type AuditSink } from "../audit.js";
-import { writerError, WriterError } from "../errors.js";
+import { PUBLIC_ACCESS_DISABLED_MESSAGE, writerError, WriterError } from "../errors.js";
 import { parseIpv4 } from "../ip.js";
 import { normalizeAzureLocation } from "../location.js";
 import { isClearanceRuleName } from "../names.js";
@@ -140,7 +140,7 @@ export class AzureChildFirewallWriter implements FirewallWriter {
         events,
         writerError({
           code: "public_access_disabled",
-          message: "Firewall rules are refused because the server is not open to public network access.",
+          message: PUBLIC_ACCESS_DISABLED_MESSAGE,
         }),
         fields,
         false,

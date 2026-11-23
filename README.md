@@ -66,7 +66,7 @@ The SDK treats a non-202 create response as an error. This package also accepts 
 
 CLI flags: `--resource-group`/`-g`, `--server-name`/`-s`, `--name`/`-n`, `--start-ip-address`, `--end-ip-address`. `-n` is the rule, not the server. MySQL Flexible Server is different again (`--name` is the server, `--rule-name` is the rule) and is not implemented.
 
-No firewall-rule cap is documented for PostgreSQL Flexible Server here, and none is invented. A private-access server is refused when the parent read says public network access is disabled or a delegated subnet is set. Official docs describe up to a five-minute propagation window.
+No firewall-rule cap is documented for PostgreSQL Flexible Server here, and none is invented. A server with public network access disabled, or a delegated subnet, is refused with `public_access_disabled`. The same code is used when ARM returns SQL `DenyPublicEndpointEnabled` or the PostgreSQL message that firewall rules cannot be requested for a private-access server. The writers do not enable public access. Official docs describe up to a five-minute propagation window.
 
 Creating a rule whose name already exists updates that rule in place on Azure. This package reads first and refuses when the stored address or the stored name casing differs. There is no `If-Match` on these resources. A rule created by someone else in the gap between the read and the PUT can still be overwritten. Unguessable names are the mitigation. That race is a residual, and it is untested live.
 
@@ -143,8 +143,8 @@ This is a manual run on a machine that already has `az login`. It is not part of
 
 It creates one resource group, `rg-clearance-smoke-<random>`, tagged `purpose=clearance-smoke` and `created-by=live-smoke`. Inside that group:
 
-- An Azure SQL logical server with Microsoft Entra-only authentication. The signed-in user is the Entra admin. No SQL password is set, and no database is created, so there is no SQL compute SKU.
-- An Azure Database for PostgreSQL Flexible Server, Burstable `Standard_B1ms`, 32 GiB (the minimum), public network access on, and password authentication disabled. The signed-in user is the Entra admin. No password is generated or printed.
+- An Azure SQL logical server with Microsoft Entra-only authentication and public network access enabled. The signed-in user is the Entra admin. No SQL password is set, and no database is created, so there is no SQL compute SKU. Create passes `--enable-public-network true`. The script then runs `az sql server update --enable-public-network true`, prints `publicNetworkAccess`, and stops before any firewall rule if the value is not `Enabled`.
+- An Azure Database for PostgreSQL Flexible Server, Burstable `Standard_B1ms`, 32 GiB (the minimum), public network access on, and password authentication disabled. The signed-in user is the Entra admin. No password is generated or printed. Create uses `--public-access Enabled`. In current Azure CLI, `None` sets public network access to Disabled and adds no rule, so firewall commands are rejected. `Enabled` turns public access on and does not add a client-IP or allow-all rule. The script updates with the same flag, prints `network.publicNetworkAccess`, and stops before any firewall rule if the value is not `Enabled`.
 
 B1ms is the smallest flexible-server SKU. The cost of a run is that server for as long as it exists, plus the time to provision it. Provisioning is usually 10–20 minutes, most of it the PostgreSQL server. The script deletes the group on exit, including after an error or Ctrl-C. If the group is left behind, the flexible server keeps billing until the group is deleted.
 

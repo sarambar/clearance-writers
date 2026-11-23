@@ -138,7 +138,7 @@ az postgres flexible-server create \
   --version 16 \
   --backup-retention 7 \
   --geo-redundant-backup Disabled \
-  --public-access None \
+  --public-access Enabled \
   --microsoft-entra-auth Enabled \
   --password-auth Disabled \
   --admin-object-id "$admin_id" \
@@ -147,6 +147,50 @@ az postgres flexible-server create \
   --yes \
   --only-show-errors \
   --output none
+
+# New SQL servers default publicNetworkAccess to Disabled. Create's
+# --enable-public-network is not enough on every az build, so set it again
+# and read it back before any firewall call.
+az sql server update \
+  --name "$SQL_NAME" \
+  --resource-group "$RG" \
+  --subscription "$SUBSCRIPTION_ID" \
+  --enable-public-network true \
+  --only-show-errors \
+  --output none
+sql_public="$(az sql server show \
+  --name "$SQL_NAME" \
+  --resource-group "$RG" \
+  --subscription "$SUBSCRIPTION_ID" \
+  --query publicNetworkAccess \
+  --output tsv)"
+printf '%s\n' "SQL publicNetworkAccess: ${sql_public}"
+if [ "$sql_public" != "Enabled" ]; then
+  printf '%s\n' "SQL public network access is '${sql_public}'. Stopping before firewall rules." >&2
+  exit 1
+fi
+
+# Enabled sets network.publicNetworkAccess to Enabled and does not add a rule.
+# The value None disables public access in current az, so it is not used.
+az postgres flexible-server update \
+  --resource-group "$RG" \
+  --name "$PG_NAME" \
+  --subscription "$SUBSCRIPTION_ID" \
+  --public-access Enabled \
+  --yes \
+  --only-show-errors \
+  --output none
+pg_public="$(az postgres flexible-server show \
+  --resource-group "$RG" \
+  --name "$PG_NAME" \
+  --subscription "$SUBSCRIPTION_ID" \
+  --query network.publicNetworkAccess \
+  --output tsv)"
+printf '%s\n' "PostgreSQL publicNetworkAccess: ${pg_public}"
+if [ "$pg_public" != "Enabled" ]; then
+  printf '%s\n' "PostgreSQL public network access is '${pg_public}'. Stopping before firewall rules." >&2
+  exit 1
+fi
 
 az sql server firewall-rule create \
   --resource-group "$RG" \
