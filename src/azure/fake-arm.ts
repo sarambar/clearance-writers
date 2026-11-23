@@ -102,7 +102,7 @@ export class FakeArm implements HttpTransport {
       publicNetworkAccess: seed.publicNetworkAccess ?? "Enabled",
       delegatedSubnet: seed.delegatedSubnet ?? false,
       rules,
-      lro: seed.lro ?? (profile.id === AZURE_POSTGRES_FIREWALL_PROFILE.id ? "async" : "sync"),
+      lro: seed.lro ?? profile.lro,
     });
   }
 
@@ -558,22 +558,26 @@ function ruleResource(server: StoredServer, rule: FakeRule): unknown {
 }
 
 function parentResource(server: StoredServer): unknown {
-  const network: Record<string, unknown> = {
-    publicNetworkAccess: server.publicNetworkAccess,
-  };
-  if (server.delegatedSubnet) {
-    network.delegatedSubnetResourceId =
-      "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-example/providers/Microsoft.Network/virtualNetworks/example/subnets/example";
-  }
+  const delegated =
+    "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-example/providers/Microsoft.Network/virtualNetworks/example/subnets/example";
+  const properties: Record<string, unknown> =
+    server.profile.id === AZURE_SQL_FIREWALL_PROFILE.id
+      ? {
+          publicNetworkAccess: server.publicNetworkAccess,
+          ...(server.delegatedSubnet ? { network: { delegatedSubnetResourceId: delegated } } : {}),
+        }
+      : {
+          network: {
+            publicNetworkAccess: server.publicNetworkAccess,
+            ...(server.delegatedSubnet ? { delegatedSubnetResourceId: delegated } : {}),
+          },
+        };
   return {
     id: server.parent.canonicalId,
-    name: server.parent.serverName,
+    name: server.parent.parentName,
     type: `${server.profile.providerNamespace}/${server.profile.parentType}`,
     location: displayAzureLocation(server.locationNormalized),
-    properties: {
-      publicNetworkAccess: server.publicNetworkAccess,
-      network,
-    },
+    properties,
   };
 }
 

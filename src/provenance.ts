@@ -7,7 +7,7 @@
  */
 export const WRITERS_VERSION = "0.0.0";
 
-const SHA_PATTERN = /^[0-9a-f]{7,40}$/;
+const SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 /**
  * Git commit this process is actually running.

@@ -43,10 +43,12 @@ export interface AzureWriterOptions {
 }
 
 /**
- * One REST adapter for Azure firewall rules that are child resources.
- * SQL and PostgreSQL each pass a profile. The four FirewallWriter methods
- * do not change between them, and they do not change for a later cloud.
- * Collection PUT (replace every rule) is never sent.
+ * REST adapter for Azure firewall rules that are named child resources.
+ * SQL and PostgreSQL each pass a profile. Collection PUT, which replaces
+ * every rule, is never sent from this class.
+ * A later whole-list cloud (Key Vault, Storage, an AWS security group) is a
+ * new class that implements FirewallWriter and merges inside add and remove.
+ * It must not be added by widening this class.
  */
 export class AzureChildFirewallWriter implements FirewallWriter {
   readonly descriptor: WriterDescriptor;
@@ -95,7 +97,19 @@ export class AzureChildFirewallWriter implements FirewallWriter {
     }
     const locationRaw = readLocation(parent.body);
     const locationNormalized = locationRaw === null ? null : normalizeAzureLocation(locationRaw);
-    if (validated.value.expectedLocation !== null) {
+    const expectedNormalized =
+      validated.value.expectedLocation === null ? null : normalizeAzureLocation(validated.value.expectedLocation);
+    if (validated.value.expectedLocation !== null && expectedNormalized === null) {
+      return this.failed(
+        "add",
+        events,
+        writerError({ code: "invalid_input", message: "Expected location is not an Azure location name." }),
+        fields,
+        false,
+        parent.requestId,
+      );
+    }
+    if (expectedNormalized !== null) {
       if (locationNormalized === null) {
         return this.failed(
           "add",
@@ -106,7 +120,7 @@ export class AzureChildFirewallWriter implements FirewallWriter {
           parent.requestId,
         );
       }
-      if (locationNormalized !== validated.value.expectedLocation) {
+      if (locationNormalized !== expectedNormalized) {
         return this.failed(
           "add",
           events,
@@ -143,7 +157,7 @@ export class AzureChildFirewallWriter implements FirewallWriter {
     const existing = listed.rules.find((rule) => rule.ruleName.toLowerCase() === validated.value.ruleName.toLowerCase());
     if (existing !== undefined) {
       const sameAddress = existing.startIpv4 === wantedStart && existing.endIpv4 === wantedEnd;
-      if (!sameAddress || existing.ruleName !== validated.value.ruleName) {
+      if (!sameAddress) {
         return this.failed(
           "add",
           events,
@@ -184,7 +198,8 @@ export class AzureChildFirewallWriter implements FirewallWriter {
       properties: { startIpAddress: wantedStart, endIpAddress: wantedEnd },
     });
     if (!put.ok) {
-      const applied = await this.ruleHasAddress(parsed.value, validated.value.ruleName, wantedStart, wantedEnd);
+      const presence = await this.rulePresence(parsed.value, validated.value.ruleName, wantedStart, wantedEnd);
+      const applied = presence !== "absent";
       return this.failed("add", events, withApplied(put.error, applied), fields, applied, put.requestId);
     }
     const verified = await this.readNamedRule(parsed.value, validated.value.ruleName);
@@ -237,9 +252,9 @@ export class AzureChildFirewallWriter implements FirewallWriter {
     const intentOk = await this.record(events, "remove", "intent", "succeeded", "ok", fields, false, false, null);
     const current = await this.readNamedRule(parsed.value, validated.value.ruleName);
     if (!current.ok && current.error.code !== "not_found") {
-      return this.failed("remove", events, current.error, fields, false, current.requestId);
+      return this.failed("remove", events, withApplied(current.error, true), fields, true, current.requestId);
     }
-    if (current.ok && current.rule.ruleName !== validated.value.ruleName) {
+    if (current.ok && current.rule.ruleName.toLowerCase() !== validated.value.ruleName.toLowerCase()) {
       return this.failed(
         "remove",
         events,
@@ -280,10 +295,15 @@ export class AzureChildFirewallWriter implements FirewallWriter {
         this.profile.apiVersion,
       );
       if (!deleted.ok && deleted.error.code !== "not_found") {
-        const stillThere = await this.ruleExists(parsed.value, validated.value.ruleName);
-        return this.failed("remove", events, withApplied(deleted.error, stillThere), fields, stillThere, deleted.requestId);
+        const presence = await this.rulePresence(parsed.value, validated.value.ruleName);
+        if (presence === "absent") {
+          alreadyAbsent = true;
+        } else {
+          return this.failed("remove", events, withApplied(deleted.error, true), fields, true, deleted.requestId);
+        }
+      } else {
+        alreadyAbsent = deleted.ok === false;
       }
-      alreadyAbsent = deleted.ok === false;
     }
     const after = await this.readNamedRule(parsed.value, validated.value.ruleName);
     if (after.ok) {
@@ -433,14 +453,24 @@ export class AzureChildFirewallWriter implements FirewallWriter {
     return { ok: true, rule, requestId: response.requestId };
   }
 
-  private async ruleHasAddress(parent: ParsedParent, ruleName: string, start: string, end: string): Promise<boolean> {
+  /**
+   * `absent` only on a clean not-found. A failed or unreadable GET is `unknown`
+   * so callers keep treating the rule as applied and the sweeper still runs.
+   */
+  private async rulePresence(
+    parent: ParsedParent,
+    ruleName: string,
+    start?: string,
+    end?: string,
+  ): Promise<"present" | "absent" | "unknown"> {
     const rule = await this.readNamedRule(parent, ruleName);
-    return rule.ok && rule.rule.startIpv4 === start && rule.rule.endIpv4 === end;
-  }
-
-  private async ruleExists(parent: ParsedParent, ruleName: string): Promise<boolean> {
-    const rule = await this.readNamedRule(parent, ruleName);
-    return rule.ok;
+    if (!rule.ok) {
+      return rule.error.code === "not_found" ? "absent" : "unknown";
+    }
+    if (start !== undefined && end !== undefined && (rule.rule.startIpv4 !== start || rule.rule.endIpv4 !== end)) {
+      return "present";
+    }
+    return "present";
   }
 
   private async denied(
@@ -449,7 +479,10 @@ export class AzureChildFirewallWriter implements FirewallWriter {
     fields: AuditFields,
   ): Promise<WriterOutcome<never>> {
     const events: AuditEvent[] = [];
-    await this.record(events, operation, "result", "denied", error.code, fields, false, false, error.cloudCode);
+    const recorded = await this.record(events, operation, "result", "denied", error.code, fields, false, false, error.cloudCode);
+    if (!recorded) {
+      return this.auditFailed("audit_intent_failed", events, false, false);
+    }
     return { ok: false, error, audit: events };
   }
 

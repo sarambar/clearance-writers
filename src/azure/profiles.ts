@@ -19,8 +19,8 @@ export interface CliFlagPin {
   resourceGroupFlags: readonly string[];
   serverFlags: readonly string[];
   ruleFlags: readonly string[];
-  startIpFlag: "--start-ip-address";
-  endIpFlag: "--end-ip-address";
+  startIpFlag: string;
+  endIpFlag: string;
   /** Flags that must not be used to name the server. Lesson 8. */
   serverMustNotUse: readonly string[];
 }
@@ -38,13 +38,14 @@ export interface AzureChildFirewallProfile {
   serverNameMax: number;
   ruleCap: number | null;
   deleteGuard: "none" | "refuse-last-rule";
+  /** sync matches SQL firewall rules. async matches flexible-server firewall LROs. */
+  lro: "sync" | "async";
   /** Cloud-side minimum. Clearance names are longer than either minimum. */
   cloudRuleNameMin: number;
   permissions: readonly string[];
   cli: CliFlagPin;
-  /** Parent read lists database names on SQL. Null when there is no such note. */
+  /** What parent read exposes besides the firewall list. */
   knownReadExposure: string | null;
-  propagationSeconds: number;
 }
 
 export const AZURE_SQL_FIREWALL_ACTIONS = [
@@ -77,11 +78,11 @@ export const AZURE_SQL_FIREWALL_PROFILE: AzureChildFirewallProfile = {
   serverNameMax: 63,
   ruleCap: SQL_RULE_CAP,
   deleteGuard: "none",
+  lro: "sync",
   cloudRuleNameMin: 1,
   permissions: AZURE_SQL_FIREWALL_ACTIONS,
   knownReadExposure:
-    "Microsoft.Sql/servers/read can list database names on the server. That is metadata, not data-plane access. Do not add databases/read or a database login.",
-  propagationSeconds: 5 * 60,
+    "Microsoft.Sql/servers/read returns administratorLogin and can list database names. It does not return the administrator password. Do not add databases/read or a database login.",
   cli: {
     command: "az sql server firewall-rule",
     resourceGroupFlags: ["--resource-group", "-g"],
@@ -106,10 +107,11 @@ export const AZURE_POSTGRES_FIREWALL_PROFILE: AzureChildFirewallProfile = {
   serverNameMax: 63,
   ruleCap: null,
   deleteGuard: "none",
+  lro: "async",
   cloudRuleNameMin: 3,
   permissions: AZURE_POSTGRES_FIREWALL_ACTIONS,
-  knownReadExposure: null,
-  propagationSeconds: 5 * 60,
+  knownReadExposure:
+    "Microsoft.DBforPostgreSQL/flexibleServers/read returns administratorLogin. It does not return the administrator password. Do not grant flexibleServers/write or a database login.",
   cli: {
     command: "az postgres flexible-server firewall-rule",
     resourceGroupFlags: ["--resource-group", "-g"],
@@ -124,10 +126,12 @@ export const AZURE_POSTGRES_FIREWALL_PROFILE: AzureChildFirewallProfile = {
 export interface UnimplementedService {
   id: string;
   implemented: false;
+  listShape: "child-resource" | "whole-list";
   reason: string;
   deleteGuard: "none" | "refuse-last-rule";
   permissions: readonly string[];
-  cliNote: string;
+  /** Null for whole-list services, which do not have a per-rule CLI create. */
+  cli: CliFlagPin | null;
 }
 
 /**
@@ -139,7 +143,8 @@ export const UNIMPLEMENTED_SERVICES: readonly UnimplementedService[] = [
   {
     id: "azure-mysql-flexible-firewall",
     implemented: false,
-    reason: "Same child-resource model as PostgreSQL Flexible Server. Not implemented.",
+    listShape: "child-resource",
+    reason: "Same child-resource model as PostgreSQL Flexible Server. Not implemented. Do not copy the PostgreSQL flag pair.",
     deleteGuard: "none",
     permissions: [
       "Microsoft.DBforMySQL/flexibleServers/read",
@@ -147,14 +152,22 @@ export const UNIMPLEMENTED_SERVICES: readonly UnimplementedService[] = [
       "Microsoft.DBforMySQL/flexibleServers/firewallRules/write",
       "Microsoft.DBforMySQL/flexibleServers/firewallRules/delete",
     ],
-    cliNote:
-      "az mysql flexible-server firewall-rule uses --name for the server and --rule-name for the rule. Do not reuse the PostgreSQL --server-name / --name pair.",
+    cli: {
+      command: "az mysql flexible-server firewall-rule",
+      resourceGroupFlags: ["--resource-group", "-g"],
+      serverFlags: ["--name"],
+      ruleFlags: ["--rule-name"],
+      startIpFlag: "--start-ip-address",
+      endIpFlag: "--end-ip-address",
+      serverMustNotUse: ["--server-name", "--rule-name"],
+    },
   },
   {
     id: "azure-redis-classic-firewall",
     implemented: false,
+    listShape: "child-resource",
     reason:
-      "Classic Microsoft.Cache/redis only. An empty rule list with public access enabled opens the cache, so delete must refuse the last rule. Managed Redis (Microsoft.Cache/redisEnterprise) is a different API and is out of scope.",
+      "Classic Microsoft.Cache/redis only. An empty rule list with public access enabled opens the cache, so delete must refuse the last rule. Managed Redis (Microsoft.Cache/redisEnterprise) is a different API and is out of scope. Not implemented.",
     deleteGuard: "refuse-last-rule",
     permissions: [
       "Microsoft.Cache/redis/read",
@@ -162,11 +175,20 @@ export const UNIMPLEMENTED_SERVICES: readonly UnimplementedService[] = [
       "Microsoft.Cache/redis/firewallRules/write",
       "Microsoft.Cache/redis/firewallRules/delete",
     ],
-    cliNote: "az redis firewall-rules uses --name for the cache and --rule-name for the rule, with --start-ip and --end-ip.",
+    cli: {
+      command: "az redis firewall-rules",
+      resourceGroupFlags: ["--resource-group", "-g"],
+      serverFlags: ["--name"],
+      ruleFlags: ["--rule-name"],
+      startIpFlag: "--start-ip",
+      endIpFlag: "--end-ip",
+      serverMustNotUse: ["--server-name", "--start-ip-address"],
+    },
   },
   {
     id: "azure-synapse-workspace-firewall",
     implemented: false,
+    listShape: "child-resource",
     reason: "Workspace child-resource firewall. Not implemented. A workspace rule covers every public endpoint on that workspace.",
     deleteGuard: "none",
     permissions: [
@@ -175,7 +197,42 @@ export const UNIMPLEMENTED_SERVICES: readonly UnimplementedService[] = [
       "Microsoft.Synapse/workspaces/firewallRules/write",
       "Microsoft.Synapse/workspaces/firewallRules/delete",
     ],
-    cliNote: "az synapse workspace firewall-rule uses --workspace-name for the workspace and --name for the rule.",
+    cli: {
+      command: "az synapse workspace firewall-rule",
+      resourceGroupFlags: ["--resource-group", "-g"],
+      serverFlags: ["--workspace-name"],
+      ruleFlags: ["--name", "-n"],
+      startIpFlag: "--start-ip-address",
+      endIpFlag: "--end-ip-address",
+      serverMustNotUse: ["--server-name", "--name"],
+    },
+  },
+  {
+    id: "azure-key-vault-network-acl",
+    implemented: false,
+    listShape: "whole-list",
+    reason: "Network ACLs are a property of the vault. A future adapter implements FirewallWriter and merges inside add and remove. Not this child-resource class.",
+    deleteGuard: "none",
+    permissions: [],
+    cli: null,
+  },
+  {
+    id: "azure-storage-network-acl",
+    implemented: false,
+    listShape: "whole-list",
+    reason: "IP rules live on the storage account. A future adapter merges inside add and remove. Not this child-resource class.",
+    deleteGuard: "none",
+    permissions: [],
+    cli: null,
+  },
+  {
+    id: "aws-security-group",
+    implemented: false,
+    listShape: "whole-list",
+    reason: "An AWS adapter implements the same four FirewallWriter operations. It does not speak ARM.",
+    deleteGuard: "none",
+    permissions: [],
+    cli: null,
   },
 ];
 
@@ -183,7 +240,8 @@ export interface ParsedParent {
   canonicalId: string;
   subscriptionId: string;
   resourceGroup: string;
-  serverName: string;
+  /** Last segment of the parent id. A server here; a later adapter may use another parent name. */
+  parentName: string;
 }
 
 const GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -231,12 +289,12 @@ export function parseAzureParentId(
   const canonicalId = `/subscriptions/${subscription}/resourceGroups/${group}/providers/${profile.providerNamespace}/${profile.parentType}/${server}`;
   return {
     ok: true,
-    value: { canonicalId, subscriptionId: subscription, resourceGroup: group, serverName: server },
+    value: { canonicalId, subscriptionId: subscription, resourceGroup: group, parentName: server },
   };
 }
 
 export function parentPath(profile: AzureChildFirewallProfile, parent: ParsedParent): string {
-  return `/subscriptions/${parent.subscriptionId}/resourceGroups/${parent.resourceGroup}/providers/${profile.providerNamespace}/${profile.parentType}/${parent.serverName}`;
+  return `/subscriptions/${parent.subscriptionId}/resourceGroups/${parent.resourceGroup}/providers/${profile.providerNamespace}/${profile.parentType}/${parent.parentName}`;
 }
 
 export function collectionPath(profile: AzureChildFirewallProfile, parent: ParsedParent): string {

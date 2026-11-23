@@ -4,22 +4,18 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
+import { FakeArm } from "../src/azure/fake-arm.js";
+import { AZURE_POSTGRES_FIREWALL_PROFILE, AZURE_SQL_FIREWALL_PROFILE, UNIMPLEMENTED_SERVICES } from "../src/azure/profiles.js";
+import { validateRoleDefinitionDeleteArgs } from "../src/azure/role-definition.js";
+import type { HttpRequest, HttpResponse, HttpTransport } from "../src/azure/http.js";
 import {
-  AZURE_POSTGRES_FIREWALL_PROFILE,
-  AZURE_SQL_FIREWALL_PROFILE,
-  FakeArm,
   SQL_FIREWALL_CACHE_WINDOW_SECONDS,
-  UNIMPLEMENTED_SERVICES,
   classifyReachability,
   exposureBoundSeconds,
   normalizeAzureLocation,
   observePostgresDriverError,
   observeSqlDriverError,
   postDeleteProbePassed,
-  validateRoleDefinitionDeleteArgs,
-  type HttpRequest,
-  type HttpResponse,
-  type HttpTransport,
 } from "../src/index.js";
 import { IP, RULE, SQL_ID, TOKEN, addRequest, harness } from "./helpers.js";
 
@@ -170,8 +166,17 @@ describe("lessons", () => {
     }
     const mysql = UNIMPLEMENTED_SERVICES.find((service) => service.id === "azure-mysql-flexible-firewall");
     assert.equal(mysql?.implemented, false);
-    assert.match(mysql?.cliNote ?? "", /--rule-name/);
-    assert.match(mysql?.cliNote ?? "", /--name/);
+    assert.deepEqual(mysql?.cli?.serverFlags, ["--name"]);
+    assert.deepEqual(mysql?.cli?.ruleFlags, ["--rule-name"]);
+    assert.equal(mysql?.cli?.serverFlags.includes("--server-name"), false);
+    const redis = UNIMPLEMENTED_SERVICES.find((service) => service.id === "azure-redis-classic-firewall");
+    assert.equal(redis?.deleteGuard, "refuse-last-rule");
+    assert.deepEqual(redis?.cli?.startIpFlag, "--start-ip");
+    assert.equal(redis?.cli?.serverFlags.includes("--start-ip-address"), false);
+    assert.equal(
+      classifyReachability(observePostgresDriverError({ message: "connection terminated unexpectedly" })),
+      "tool-error",
+    );
   });
 
   it("9. puts the operator line on the error channel", async () => {

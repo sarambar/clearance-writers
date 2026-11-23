@@ -1,7 +1,7 @@
 {
   "Name": "Sarambar Clearance SQL Firewall",
   "IsCustom": true,
-  "Description": "Create and delete Azure SQL logical server firewall rules only. No data-plane access. servers/read can list database names; that exposure is accepted and disclosed. Assign this role at the server or its resource group, not at a management group.",
+  "Description": "Create and delete Azure SQL logical server firewall rules only. No data-plane access. servers/read can list database names and returns administratorLogin, not the password. Assign at one server or its resource group. Narrow AssignableScopes to that group before creating the definition.",
   "Actions": [
     "Microsoft.Sql/servers/read",
     "Microsoft.Sql/servers/firewallRules/read",

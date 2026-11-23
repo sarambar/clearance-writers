@@ -55,6 +55,18 @@ export class InMemoryFirewallWriter implements FirewallWriter {
         writerError({ code: "invalid_resource_id", message: "In-memory resource ids use the memory: prefix." }),
       );
     }
+    const intent = await this.emit("add", "intent", "succeeded", "ok", validated.value, false, false);
+    if (intent === null) {
+      return {
+        ok: false,
+        audit: [],
+        error: writerError({
+          code: "audit_intent_failed",
+          message: "The audit sink did not accept the intent event.",
+          ruleApplied: false,
+        }),
+      };
+    }
     const bucket = this.bucket(validated.value.resourceId);
     const existing = [...bucket.values()].find((rule) => rule.ruleName.toLowerCase() === validated.value.ruleName.toLowerCase());
     if (existing !== undefined) {
@@ -92,7 +104,7 @@ export class InMemoryFirewallWriter implements FirewallWriter {
       owned: true,
       providerId: null,
     });
-    return this.finish("add", "succeeded", "ok", validated.value, false, true, {
+    const created = await this.finish<AddRuleValue>("add", "succeeded", "ok", validated.value, false, true, {
       resourceId: validated.value.resourceId,
       ruleName: validated.value.ruleName,
       startIpv4: validated.value.address.startIpv4,
@@ -102,6 +114,10 @@ export class InMemoryFirewallWriter implements FirewallWriter {
       locationNormalized: null,
       ruleCountBefore: bucket.size - 1,
     });
+    if (!created.ok) {
+      bucket.delete(validated.value.ruleName);
+    }
+    return created;
   }
 
   async removeRule(request: RemoveRuleRequest): Promise<WriterOutcome<RemoveRuleValue>> {
@@ -120,6 +136,7 @@ export class InMemoryFirewallWriter implements FirewallWriter {
         writerError({ code: "invalid_resource_id", message: "In-memory resource ids use the memory: prefix." }),
       );
     }
+    const intentOk = (await this.emit("remove", "intent", "succeeded", "ok", validated.value, false, false)) !== null;
     const bucket = this.bucket(validated.value.resourceId);
     const existing = bucket.get(validated.value.ruleName);
     const alreadyAbsent = existing === undefined;
@@ -135,12 +152,25 @@ export class InMemoryFirewallWriter implements FirewallWriter {
         writerError({ code: "delete_not_verified", message: "The in-memory rule is still present.", ruleApplied: true }),
       );
     }
-    return this.finish("remove", "succeeded", "ok", validated.value, false, false, {
+    const removed = await this.finish<RemoveRuleValue>("remove", "succeeded", "ok", validated.value, false, false, {
       resourceId: validated.value.resourceId,
       ruleName: validated.value.ruleName,
       alreadyAbsent,
       removalVerified: true,
     });
+    if (!intentOk && removed.ok) {
+      return {
+        ok: false,
+        audit: removed.audit,
+        error: writerError({
+          code: "audit_intent_failed",
+          message: "The audit sink did not accept the intent event. Cleanup was not skipped.",
+          removalVerified: true,
+          ruleApplied: false,
+        }),
+      };
+    }
+    return removed;
   }
 
   async listOwnedRules(request: ListRulesRequest): Promise<WriterOutcome<RuleListValue>> {
@@ -209,6 +239,38 @@ export class InMemoryFirewallWriter implements FirewallWriter {
     const created = new Map<string, RuleView>();
     this.rules.set(resourceId, created);
     return created;
+  }
+
+  private async emit(
+    operation: "add" | "remove" | "list_owned" | "read_whole_list",
+    phase: "intent" | "result",
+    outcome: "succeeded" | "failed" | "denied",
+    detailCode: string,
+    validated: { resourceId: string; ruleName: string; address?: { canonical: string }; ttlSeconds?: number } | null,
+    replayed: boolean,
+    ruleApplied: boolean,
+    canonicalId?: string,
+  ): Promise<AuditEvent | null> {
+    const event = buildAuditEvent({
+      phase,
+      operation,
+      outcome,
+      service: this.descriptor.id,
+      detailCode,
+      resourceId: canonicalId ?? validated?.resourceId ?? null,
+      ruleName: validated?.ruleName ?? null,
+      ipv4: validated?.address?.canonical ?? null,
+      ttlSeconds: validated?.ttlSeconds ?? null,
+      replayed,
+      ruleApplied,
+      occurredAt: this.now().toISOString(),
+    });
+    try {
+      await this.auditSink.emit(event);
+    } catch {
+      return null;
+    }
+    return event;
   }
 
   private async finish<T>(

@@ -32,7 +32,7 @@ export function canonicalJson(value: unknown): string {
 }
 
 const DISALLOWED =
-  /[\u0000-\u001F\u007F\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/;
+  /[\u0000-\u001F\u007F-\u009F\u200B-\u200F\u2028\u2029\u202A-\u202E\u2066-\u2069\uFEFF]/;
 
 /**
  * Escape a value for an error line or log field.

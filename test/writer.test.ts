@@ -4,11 +4,14 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
+import { AzureChildFirewallWriter } from "../src/azure/child-writer.js";
 import {
-  AzureChildFirewallWriter,
   AZURE_POSTGRES_FIREWALL_API_VERSION,
   AZURE_SQL_FIREWALL_API_VERSION,
   AZURE_SQL_FIREWALL_PROFILE,
+  UNIMPLEMENTED_SERVICES,
+} from "../src/azure/profiles.js";
+import {
   InMemoryFirewallWriter,
   SQL_RULE_CAP,
   type FirewallWriter,
@@ -147,7 +150,7 @@ describe("azure postgres writer", () => {
     const { fake, writer, delays, resourceId } = harness("pg");
     const added = await writer.addRule(addRequest(resourceId));
     assert.equal(added.ok, true);
-    assert.ok(delays.includes(0));
+    assert.ok(delays.includes(30_000));
     assert.equal(new URL(fake.requests.find((request) => request.method === "PUT")?.url ?? "https://example.com").searchParams.get("api-version"), AZURE_POSTGRES_FIREWALL_API_VERSION);
     assert.equal(fake.rulesFor(PG_ID)?.length, 1);
     const removed = await writer.removeRule({ resourceId, ruleName: RULE, ledgerOwned: true });
@@ -214,8 +217,11 @@ describe("writer contract", () => {
     const { fake, audit, resourceId } = harness("sql", {
       rules: [{ name: RULE, startIpv4: IP, endIpv4: IP }],
     });
+    const redis = UNIMPLEMENTED_SERVICES.find((service) => service.id === "azure-redis-classic-firewall");
+    assert.equal(redis?.deleteGuard, "refuse-last-rule");
+    assert.equal(AZURE_SQL_FIREWALL_PROFILE.deleteGuard, "none");
     const guarded = new AzureChildFirewallWriter(
-      { ...AZURE_SQL_FIREWALL_PROFILE, id: "azure-sql-last-rule-seam", deleteGuard: "refuse-last-rule" },
+      { ...AZURE_SQL_FIREWALL_PROFILE, deleteGuard: redis?.deleteGuard ?? "none" },
       {
         transport: fake,
         tokenProvider: { async getToken() { return "test-token"; } },

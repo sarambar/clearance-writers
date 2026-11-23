@@ -1,9 +1,9 @@
 // Copyright 2026 Sarambar
 // SPDX-License-Identifier: Apache-2.0
 
+import { containsDisallowedCharacters } from "./codec.js";
 import { writerError, type WriterError } from "./errors.js";
 import { parseAllowAddress, parseTtlSeconds, STRICT_IP_POLICY, type IpPolicy, type ParsedAddress } from "./ip.js";
-import { normalizeAzureLocation } from "./location.js";
 import { parseOpaqueResourceId, parseRuleName } from "./names.js";
 import type { AddRuleRequest, RemoveRuleRequest } from "./writer.js";
 
@@ -53,13 +53,18 @@ export function validateAddRequest(
   }
   let expectedLocation: string | null = null;
   if (request.expectedLocation !== undefined) {
-    expectedLocation = normalizeAzureLocation(request.expectedLocation);
-    if (expectedLocation === null) {
+    if (
+      typeof request.expectedLocation !== "string" ||
+      request.expectedLocation.trim().length === 0 ||
+      request.expectedLocation.trim().length > 64 ||
+      containsDisallowedCharacters(request.expectedLocation)
+    ) {
       return {
         ok: false,
-        error: writerError({ code: "invalid_input", message: "Expected location is not a single Azure location name." }),
+        error: writerError({ code: "invalid_input", message: "Expected location must be a single-line location name." }),
       };
     }
+    expectedLocation = request.expectedLocation.trim();
   }
   return {
     ok: true,

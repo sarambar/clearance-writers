@@ -32,7 +32,7 @@ Not implemented, and not safe to call: MySQL Flexible Server, classic Azure Cach
 
 Assign the custom role at the server, or at that server's resource group. Do not assign it at a management group. Do not grant Owner, Contributor, or the parent `write` action. `DataActions` is empty. The Clearance identity must not get a database login.
 
-`Microsoft.Sql/servers/read` can list database names on that server. That is metadata, not data-plane access. It is a known exposure. Do not add `Microsoft.Sql/servers/databases/read` to hide or to widen it.
+`Microsoft.Sql/servers/read` can list database names on that server and returns `administratorLogin`. `Microsoft.DBforPostgreSQL/flexibleServers/read` also returns `administratorLogin`. Neither read returns the administrator password. This is metadata, not data-plane access. Do not add a database login or a parent `write`.
 
 The JSON files in `roles/` are the role definitions. `{subscriptionId}` is a placeholder, not an account id. Narrow `AssignableScopes` to the resource group when the definition is created.
 
@@ -87,7 +87,7 @@ Every audit event includes:
 - `writersVersion`, the `version` in `package.json` (currently `0.0.0`)
 - `writersCommitSha`, from the environment variable `CLEARANCE_WRITERS_COMMIT_SHA`
 
-The private backend sets that variable to the pinned commit it actually deployed. A missing or malformed value is the literal `unknown`. An operation cannot supply a SHA and have it recorded as this package's commit.
+The private backend sets that variable to the full commit it actually deployed: 40 or 64 lowercase hex characters. A missing, short, or malformed value is the literal `unknown`. An operation cannot supply a SHA and have it recorded as this package's commit.
 
 An intent event with `outcome: succeeded` means the attempt was recorded. It does not mean Azure finished the change. The result event is the one that records success or failure.
 

@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Stable error codes. Authorization denial is a separate flag, not "any failure".
- * Only codes listed in AUTHORIZATION_DENIAL_CODES count as an authorization denial.
+ * Stable error codes shared by every cloud.
+ * `authorization_denied` is the cloud-neutral denial. Adapters set it.
+ * Callers should not match a cloud's raw error strings.
+ * `lro_*` means a long-running operation, not a specific vendor type.
+ * `azure_services_forbidden` is the default-policy refusal of the 0.0.0.0 sentinel.
  */
 export const WRITER_ERROR_CODES = [
   "invalid_input",
@@ -44,23 +47,6 @@ export const WRITER_ERROR_CODES = [
 ] as const;
 
 export type WriterErrorCode = (typeof WRITER_ERROR_CODES)[number];
-
-/**
- * ARM error codes that mean the identity was denied by RBAC.
- * Anything else, including BadGateway and an empty list, is not a denial.
- */
-export const AUTHORIZATION_DENIAL_CODES = [
-  "AuthorizationFailed",
-  "LinkedAuthorizationFailed",
-] as const;
-
-export type AuthorizationDenialCode = (typeof AUTHORIZATION_DENIAL_CODES)[number];
-
-const DENIAL_SET = new Set<string>(AUTHORIZATION_DENIAL_CODES);
-
-export function isAuthorizationDenialCode(code: string | null | undefined): boolean {
-  return code !== null && code !== undefined && DENIAL_SET.has(code);
-}
 
 export interface WriterErrorOptions {
   code: WriterErrorCode;

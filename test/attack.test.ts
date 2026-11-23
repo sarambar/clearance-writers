@@ -4,7 +4,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import type { AddRuleRequest, HttpRequest, HttpResponse, HttpTransport } from "../src/index.js";
+import type { HttpRequest, HttpResponse, HttpTransport } from "../src/azure/http.js";
+import type { AddRuleRequest } from "../src/index.js";
 import { IP, SQL_ID, TOKEN, addRequest, harness } from "./helpers.js";
 
 function hostileAdd(overrides: Record<string, unknown>): AddRuleRequest {
@@ -101,6 +102,26 @@ describe("hostile input", () => {
     const put = fake.requests.find((request) => request.method === "PUT");
     assert.match(put?.body ?? "", /"startIpAddress":"0.0.0.0"/);
     assert.match(put?.body ?? "", /"endIpAddress":"0.0.0.0"/);
+  });
+
+  it("rejects a truthy non-boolean policy flag", async () => {
+    const { fake, writer, resourceId } = harness("sql");
+    const result = await writer.addRule(
+      addRequest(resourceId, {
+        ipv4: "0.0.0.0/0",
+        ipPolicy: {
+          minimumPrefixLength: 32,
+          allowNonPublic: false,
+          allowAzureServicesRule: false,
+          allowDefaultRoute: "false" as unknown as boolean,
+        },
+      }),
+    );
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.error.code, "invalid_input");
+    }
+    assert.equal(fake.requests.length, 0);
   });
 
   it("does not delete a foreign rule even if the caller asserts ledger ownership", async () => {
@@ -206,7 +227,7 @@ describe("hostile input", () => {
     assert.equal(result.ok, false);
     if (!result.ok) {
       assert.equal(result.error.code, "unsafe_poll_url");
-      assert.equal(result.error.ruleApplied, false);
+      assert.equal(result.error.ruleApplied, true);
     }
     assert.equal(seen.some((url) => url.includes("169.254.169.254")), false);
   });

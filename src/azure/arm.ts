@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { escapeForOutput } from "../codec.js";
-import { isAuthorizationDenialCode, writerError, type WriterError } from "../errors.js";
+import { writerError, type WriterError } from "../errors.js";
 import { headerValue, sameOriginArmUrl, type ArmTokenProvider, type HttpTransport } from "./http.js";
 
 /** azure-core's default polling interval when Retry-After is absent. */
@@ -15,6 +15,7 @@ export const MAX_LRO_BUDGET_MS = 5 * 60 * 1000;
 export const MAX_RESPONSE_CHARS = 1_000_000;
 
 const REDIRECT = new Set([301, 302, 303, 307, 308]);
+const ARM_AUTHORIZATION_DENIAL = new Set(["AuthorizationFailed", "LinkedAuthorizationFailed"]);
 
 export interface ArmSuccess {
   ok: true;
@@ -119,23 +120,24 @@ export class ArmClient {
       };
     }
     const pollUrl = pollTarget.url;
+    const source = pollTarget.source;
     let budget = 0;
-    let delay = Math.min(retryAfterMs(initial.headers) ?? LRO_DEFAULT_DELAY_MS, LRO_MAX_DELAY_MS);
+    let delay = retryAfterMs(initial.headers) ?? LRO_DEFAULT_DELAY_MS;
+    const successStatuses = source === "location" ? [200, 201, 202, 204] : [200, 202];
     for (let poll = 0; poll < MAX_LRO_POLLS; poll += 1) {
-      budget += delay;
-      if (budget > MAX_LRO_BUDGET_MS) {
+      const remaining = MAX_LRO_BUDGET_MS - budget;
+      if (remaining <= 0) {
         break;
       }
-      await this.sleep(delay);
-      const status = await this.request("GET", pollUrl, undefined, [200, 202]);
+      const wait = Math.min(delay, remaining);
+      budget += wait;
+      await this.sleep(wait);
+      const status = await this.request("GET", pollUrl, undefined, successStatuses);
       if (!status.ok) {
         return status;
       }
       const state = lroState(status.body);
-      delay = Math.min(retryAfterMs(status.headers) ?? LRO_DEFAULT_DELAY_MS, LRO_MAX_DELAY_MS);
-      if (status.status === 202 && (state === "unknown" || state === "inprogress")) {
-        continue;
-      }
+      delay = retryAfterMs(status.headers) ?? LRO_DEFAULT_DELAY_MS;
       if (state === "failed") {
         const cloud = readError(status.body);
         return {
@@ -144,7 +146,7 @@ export class ArmClient {
           error: writerError({
             code: "lro_failed",
             message: escapeForOutput(cloud?.message ?? "The long-running operation failed."),
-            cloudCode: cloud?.code ?? null,
+            cloudCode: safeCloudCode(cloud?.code ?? null),
             cloudStatus: status.status,
           }),
         };
@@ -160,7 +162,13 @@ export class ArmClient {
           }),
         };
       }
-      if (state === "succeeded" || (state === "resource" && status.status === 200)) {
+      if (state === "inprogress" || status.status === 202) {
+        continue;
+      }
+      if (source === "async" && state === "succeeded") {
+        return status;
+      }
+      if (source === "location" && (status.status === 200 || status.status === 201 || status.status === 204)) {
         return status;
       }
     }
@@ -321,36 +329,59 @@ function lowerHeaders(headers: Record<string, string>): Record<string, string> {
 function operationUrl(
   headers: Record<string, string>,
   endpoint: string,
-): { kind: "url"; url: string } | { kind: "missing" } | { kind: "unsafe" } {
+): { kind: "url"; url: string; source: "async" | "location" } | { kind: "missing" } | { kind: "unsafe" } {
   const asyncOperation = headerValue(headers, "azure-asyncoperation");
   const location = headerValue(headers, "location");
-  let safe: string | null = null;
-  let unsafe = false;
-  for (const candidate of [asyncOperation, location]) {
-    if (candidate === undefined || candidate.trim() === "") {
-      continue;
-    }
-    if (sameOriginArmUrl(candidate, endpoint) !== null) {
-      safe ??= candidate;
-    } else {
-      unsafe = true;
-    }
+  const asyncUrl = resolvePollUrl(asyncOperation, endpoint);
+  if (asyncUrl !== null) {
+    return { kind: "url", url: asyncUrl, source: "async" };
   }
-  if (unsafe) {
-    return { kind: "unsafe" };
+  const locationUrl = resolvePollUrl(location, endpoint);
+  if (locationUrl !== null) {
+    return { kind: "url", url: locationUrl, source: "location" };
   }
-  return safe === null ? { kind: "missing" } : { kind: "url", url: safe };
+  const present = [asyncOperation, location].some((value) => value !== undefined && value.trim() !== "");
+  return present ? { kind: "unsafe" } : { kind: "missing" };
+}
+
+function resolvePollUrl(candidate: string | undefined, endpoint: string): string | null {
+  if (candidate === undefined || candidate.trim() === "") {
+    return null;
+  }
+  let target: URL;
+  try {
+    target = new URL(candidate, endpoint.endsWith("/") ? endpoint : `${endpoint}/`);
+  } catch {
+    return null;
+  }
+  if (sameOriginArmUrl(target.toString(), endpoint) === null) {
+    return null;
+  }
+  return target.toString();
 }
 
 function retryAfterMs(headers: Record<string, string>): number | null {
-  const raw = headerValue(headers, "retry-after") ?? headers["retry-after"];
+  const milliseconds = headerValue(headers, "retry-after-ms") ?? headerValue(headers, "x-ms-retry-after-ms");
+  if (milliseconds !== undefined && /^[1-9][0-9]{0,8}$/.test(milliseconds.trim())) {
+    return Number(milliseconds.trim());
+  }
+  const raw = headerValue(headers, "retry-after");
   if (raw === undefined) {
     return null;
   }
-  if (!/^(0|[1-9][0-9]{0,6})$/.test(raw.trim())) {
+  const trimmed = raw.trim();
+  if (/^[1-9][0-9]{0,6}$/.test(trimmed)) {
+    return Number(trimmed) * 1000;
+  }
+  if (trimmed === "0") {
     return null;
   }
-  return Number(raw) * 1000;
+  const parsed = Date.parse(trimmed);
+  if (!Number.isNaN(parsed)) {
+    const delay = parsed - Date.now();
+    return delay > 0 ? delay : null;
+  }
+  return null;
 }
 
 function parseBody(body: string): { value: unknown; jsonError: boolean } {
@@ -432,14 +463,21 @@ function lroState(body: unknown): LroKind {
   return "unknown";
 }
 
+function safeCloudCode(code: string | null): string | null {
+  if (code === null) {
+    return null;
+  }
+  return /^[A-Za-z0-9.]{1,64}$/.test(code) ? code : "Unrecognized";
+}
+
 function classifyFailure(
   status: number,
   cloud: { code: string; message: string } | null,
   token: string,
 ): WriterError {
-  const code = cloud?.code ?? null;
+  const code = safeCloudCode(cloud?.code ?? null);
   const message = redact(cloud?.message ?? `ARM returned HTTP ${status}.`, token);
-  if (code !== null && isAuthorizationDenialCode(code)) {
+  if (code !== null && ARM_AUTHORIZATION_DENIAL.has(code)) {
     return writerError({
       code: "authorization_denied",
       message,

@@ -128,6 +128,47 @@ function invalid(code: WriterError["code"], message: string): WriterError {
   return writerError({ code, message });
 }
 
+function readPolicyFlags(
+  policy: IpPolicy,
+): { ok: true; value: { allowNonPublic: boolean; allowAzureServicesRule: boolean; allowDefaultRoute: boolean } } | { ok: false; error: WriterError } {
+  const allowNonPublic = booleanFlag(policy.allowNonPublic, "allowNonPublic");
+  const allowAzureServicesRule = booleanFlag(policy.allowAzureServicesRule, "allowAzureServicesRule");
+  const allowDefaultRoute = booleanFlag(policy.allowDefaultRoute, "allowDefaultRoute");
+  if (!allowNonPublic.ok) {
+    return allowNonPublic;
+  }
+  if (!allowAzureServicesRule.ok) {
+    return allowAzureServicesRule;
+  }
+  if (!allowDefaultRoute.ok) {
+    return allowDefaultRoute;
+  }
+  return {
+    ok: true,
+    value: {
+      allowNonPublic: allowNonPublic.value,
+      allowAzureServicesRule: allowAzureServicesRule.value,
+      allowDefaultRoute: allowDefaultRoute.value,
+    },
+  };
+}
+
+function booleanFlag(
+  value: unknown,
+  name: string,
+): { ok: true; value: boolean } | { ok: false; error: WriterError } {
+  if (value === true) {
+    return { ok: true, value: true };
+  }
+  if (value === false) {
+    return { ok: true, value: false };
+  }
+  return {
+    ok: false,
+    error: invalid("invalid_input", `Address policy ${name} must be a boolean.`),
+  };
+}
+
 /**
  * Accept a bare IPv4 host or a CIDR. Dash ranges are refused: Azure start/end
  * pairs are produced by this package, never taken from the caller as text.
@@ -171,9 +212,13 @@ export function parseAllowAddress(
   if (prefixLength > 32) {
     return { ok: false, error: invalid("invalid_input", "CIDR prefix is larger than 32.") };
   }
+  const flags = readPolicyFlags(policy);
+  if (!flags.ok) {
+    return flags;
+  }
   const hostForSpecial = parseIpv4(hostText);
   const defaultRoute = hostForSpecial === "0.0.0.0" && prefixLength === 0;
-  if (defaultRoute && !policy.allowDefaultRoute) {
+  if (defaultRoute && !flags.value.allowDefaultRoute) {
     return {
       ok: false,
       error: invalid("default_route_forbidden", "0.0.0.0/0 is refused."),
@@ -220,7 +265,7 @@ export function parseAllowAddress(
   const endIpv4 = intToIpv4(end);
 
   if (start === 0 && end === 0) {
-    if (!policy.allowAzureServicesRule) {
+    if (!flags.value.allowAzureServicesRule) {
       return {
         ok: false,
         error: invalid(
@@ -230,7 +275,7 @@ export function parseAllowAddress(
       };
     }
   } else if (start === 0 && end === 0xffffffff) {
-    if (!policy.allowDefaultRoute) {
+    if (!flags.value.allowDefaultRoute) {
       return {
         ok: false,
         error: invalid("default_route_forbidden", "0.0.0.0/0 is refused."),
@@ -244,7 +289,7 @@ export function parseAllowAddress(
       error: invalid("not_public_unicast", "Multicast and reserved addresses are refused."),
     };
   } else if (NON_PUBLIC.some((item) => overlaps(range, item))) {
-    if (!policy.allowNonPublic || !NON_PUBLIC.some((item) => contains(item, range))) {
+    if (!flags.value.allowNonPublic || !NON_PUBLIC.some((item) => contains(item, range))) {
       return {
         ok: false,
         error: invalid(

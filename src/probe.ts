@@ -59,10 +59,7 @@ export function observePostgresDriverError(input: DriverErrorInput): ProbeObserv
   if (input.sqlState === "28P01" || /password authentication failed/i.test(message)) {
     return { service: "azure-postgres", outcome: "error", sqlState: "28P01" };
   }
-  if (
-    input.code === "ETIMEDOUT" ||
-    /timeout expired|timed out|connection terminated unexpectedly/i.test(message)
-  ) {
+  if (input.code === "ETIMEDOUT" || /timeout expired|timed out/i.test(message)) {
     return { service: "azure-postgres", outcome: "timeout" };
   }
   return { service: "azure-postgres", outcome: "tool-error" };

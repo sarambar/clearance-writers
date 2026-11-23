@@ -54,7 +54,11 @@ export interface AddRuleRequest {
    */
   ledgerOwned: true;
   ipPolicy?: IpPolicy;
-  /** Compared only after Azure location normalization. */
+  /**
+   * Optional location check. Azure adapters compare this only after folding
+   * display names (`Central US` and `centralus`). Other clouds compare their
+   * own location form and must not assume that fold.
+   */
   expectedLocation?: string;
 }
 

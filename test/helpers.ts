@@ -1,13 +1,12 @@
 // Copyright 2026 Sarambar
 // SPDX-License-Identifier: Apache-2.0
 
+import { FakeArm, type FakeServerSeed } from "../src/azure/fake-arm.js";
 import {
-  FakeArm,
   MemoryAuditSink,
   createAzurePostgresFirewallWriter,
   createAzureSqlFirewallWriter,
   type AddRuleRequest,
-  type FakeServerSeed,
   type FirewallWriter,
 } from "../src/index.js";
 

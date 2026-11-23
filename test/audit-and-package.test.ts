@@ -25,7 +25,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
 describe("audit provenance", () => {
   it("records the package version and commit SHA and a content hash", async () => {
     const previous = process.env.CLEARANCE_WRITERS_COMMIT_SHA;
-    process.env.CLEARANCE_WRITERS_COMMIT_SHA = "0123456789abcdef";
+    process.env.CLEARANCE_WRITERS_COMMIT_SHA = "0123456789abcdef0123456789abcdef01234567";
     try {
       const { writer, audit, resourceId } = harness("sql");
       const added = await writer.addRule(addRequest(resourceId));
@@ -33,7 +33,7 @@ describe("audit provenance", () => {
       assert.ok(audit.events.length >= 2);
       for (const event of audit.events) {
         assert.equal(event.writersVersion, WRITERS_VERSION);
-        assert.equal(event.writersCommitSha, "0123456789abcdef");
+        assert.equal(event.writersCommitSha, "0123456789abcdef0123456789abcdef01234567");
         const { contentHash, ...body } = event;
         assert.equal(contentHash, sha256Hex(canonicalJson(body)));
         assert.equal(JSON.stringify(event).includes(TOKEN), false);
