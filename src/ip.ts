@@ -361,7 +361,7 @@ export function parseTtlSeconds(
 }
 
 /**
- * Target exposure bound from the hand-run: at most TTL plus the sweep interval.
+ * Target exposure bound: at most TTL plus the sweep interval.
  * This package does not run the sweeper. It checks the arithmetic the backend records.
  */
 export function exposureBoundSeconds(ttlSeconds: unknown, sweepIntervalSeconds: unknown): number {

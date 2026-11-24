@@ -1,12 +1,6 @@
 // Copyright 2026 Sarambar
 // SPDX-License-Identifier: Apache-2.0
 
-/**
- * Lesson 11. This package does not delete role definitions and does not shell
- * out to az. The validator records the flag shape Azure CLI requires, because
- * `az role definition delete --id` is rejected: the command requires `--name`
- * and `--scope`.
- */
 export interface RoleDefinitionDeleteArgs {
   name?: string;
   scope?: string;

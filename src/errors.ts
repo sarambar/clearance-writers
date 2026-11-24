@@ -2,19 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Stable error codes shared by every cloud.
- * `authorization_denied` is the cloud-neutral denial. Adapters set it.
- * Callers should not match a cloud's raw error strings.
- * `lro_*` means a long-running operation, not a specific vendor type.
- * `azure_services_forbidden` is the default-policy refusal of the 0.0.0.0 sentinel.
- */
-/**
  * Customer-facing text for `public_access_disabled`.
  * Writers report this and leave the server unchanged. They do not enable public access.
  */
 export const PUBLIC_ACCESS_DISABLED_MESSAGE =
   "Clearance only manages server firewall rules when public network access is enabled.";
 
+/**
+ * Stable error codes shared by every cloud.
+ * `authorization_denied` is the cloud-neutral denial. Adapters set it.
+ * Callers should not match a cloud's raw error strings.
+ * `lro_*` means a long-running operation, not a specific vendor type.
+ * `azure_services_forbidden` is the default-policy refusal of the 0.0.0.0 sentinel.
+ */
 export const WRITER_ERROR_CODES = [
   "invalid_input",
   "broad_range",

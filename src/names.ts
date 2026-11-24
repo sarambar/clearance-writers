@@ -7,10 +7,7 @@ import { writerError, type WriterError } from "./errors.js";
 /** Clearance rule names start with this exact prefix. Comparison is case-sensitive. */
 export const CLEARANCE_RULE_PREFIX = "clearance-";
 
-/**
- * Names Azure uses for "allow all Azure IPs". Never a Clearance rule.
- * The pattern below already rejects them because they lack the prefix.
- */
+/** Names Azure uses for "allow all Azure IPs". Never a Clearance rule. */
 export const RESERVED_FIREWALL_RULE_NAMES = [
   "AllowAllAzureIPs",
   "AllowAllWindowsAzureIps",
@@ -56,7 +53,6 @@ export function isClearanceRuleName(name: string): boolean {
   return parseRuleName(name).ok;
 }
 
-/** Shared limits for any cloud's resource id before the adapter parses it. */
 export function parseOpaqueResourceId(
   input: unknown,
 ): { ok: true; value: string } | { ok: false; error: WriterError } {

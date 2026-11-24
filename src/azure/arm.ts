@@ -74,10 +74,6 @@ export class ArmClient {
     return this.request("GET", url, undefined, [200]);
   }
 
-  /**
-   * PUT a named child. 200 and 201 are finished writes. 202 is polled.
-   * A 202 without a same-origin operation URL is a failure, not a success.
-   */
   async put(path: string, apiVersion: string, body: unknown): Promise<ArmCall> {
     const initial = await this.request("PUT", this.resourceUrl(path, apiVersion), JSON.stringify(body), [200, 201, 202]);
     if (!initial.ok || initial.status !== 202) {
@@ -86,7 +82,6 @@ export class ArmClient {
     return this.poll(initial, path, apiVersion);
   }
 
-  /** DELETE a named child. 200 and 204 are finished. 202 is polled. 404 is returned as not_found. */
   async delete(path: string, apiVersion: string): Promise<ArmCall> {
     const initial = await this.request("DELETE", this.resourceUrl(path, apiVersion), undefined, [200, 202, 204]);
     if (!initial.ok || initial.status !== 202) {

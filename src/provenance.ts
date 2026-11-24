@@ -1,10 +1,6 @@
 // Copyright 2026 Sarambar
 // SPDX-License-Identifier: Apache-2.0
 
-/**
- * Writers package version. Keep this equal to package.json "version".
- * A test fails if the two drift.
- */
 export const WRITERS_VERSION = "0.0.0";
 
 const SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;

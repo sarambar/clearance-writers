@@ -23,7 +23,6 @@ export function normalizeAzureLocation(value: unknown): string | null {
   return folded;
 }
 
-/** Display form the fake returns for locations the hand-run compared. */
 const DISPLAY_LOCATIONS: Record<string, string> = {
   centralus: "Central US",
   eastus: "East US",

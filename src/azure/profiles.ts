@@ -14,14 +14,12 @@ export const AZURE_POSTGRES_FIREWALL_API_VERSION = "2026-07-01-preview";
 export const SQL_RULE_CAP = 256;
 
 export interface CliFlagPin {
-  /** Full command the REST call is modeled on. This package does not shell out. */
   command: string;
   resourceGroupFlags: readonly string[];
   serverFlags: readonly string[];
   ruleFlags: readonly string[];
   startIpFlag: string;
   endIpFlag: string;
-  /** Flags that must not be used to name the server. Lesson 8. */
   serverMustNotUse: readonly string[];
 }
 
@@ -38,13 +36,10 @@ export interface AzureChildFirewallProfile {
   serverNameMax: number;
   ruleCap: number | null;
   deleteGuard: "none" | "refuse-last-rule";
-  /** sync matches SQL firewall rules. async matches flexible-server firewall LROs. */
   lro: "sync" | "async";
-  /** Cloud-side minimum. Clearance names are longer than either minimum. */
   cloudRuleNameMin: number;
   permissions: readonly string[];
   cli: CliFlagPin;
-  /** What parent read exposes besides the firewall list. */
   knownReadExposure: string | null;
 }
 
@@ -130,15 +125,9 @@ export interface UnimplementedService {
   reason: string;
   deleteGuard: "none" | "refuse-last-rule";
   permissions: readonly string[];
-  /** Null for whole-list services, which do not have a per-rule CLI create. */
   cli: CliFlagPin | null;
 }
 
-/**
- * Seams only. No writer is constructed for these. MySQL flag names differ from
- * PostgreSQL (`--name` is the server, `--rule-name` is the rule). Classic Redis
- * must refuse to delete the last rule. Synapse is a later adapter.
- */
 export const UNIMPLEMENTED_SERVICES: readonly UnimplementedService[] = [
   {
     id: "azure-mysql-flexible-firewall",
@@ -240,7 +229,6 @@ export interface ParsedParent {
   canonicalId: string;
   subscriptionId: string;
   resourceGroup: string;
-  /** Last segment of the parent id. A server here; a later adapter may use another parent name. */
   parentName: string;
 }
 

@@ -21,7 +21,7 @@ import { FOREIGN_IP, IP, OTHER_IP, OTHER_RULE, PG_ID, RULE, SQL_ID, addRequest, 
 
 describe("azure sql writer", () => {
   it("adds one named child and does not replace the collection", async () => {
-    const { fake, writer, audit, resourceId } = harness("sql", {
+    const { fake, writer, audit, resourceId, delays } = harness("sql", {
       rules: [{ name: "office-vpn", startIpv4: FOREIGN_IP, endIpv4: FOREIGN_IP }],
     });
     const added = await writer.addRule(addRequest(resourceId, { expectedLocation: "centralus" }));
@@ -45,6 +45,7 @@ describe("azure sql writer", () => {
     assert.ok(put);
     assert.equal(new URL(put.url).searchParams.get("api-version"), AZURE_SQL_FIREWALL_API_VERSION);
     assert.match(put.headers["user-agent"] ?? put.headers["User-Agent"] ?? "", /clearance-writers\/0\.0\.0/);
+    assert.equal(delays.length, 0);
     assert.equal(audit.events[0]?.phase, "intent");
     assert.equal(audit.events.at(-1)?.outcome, "succeeded");
     assert.equal(audit.events.every((event) => event.writersVersion === "0.0.0"), true);

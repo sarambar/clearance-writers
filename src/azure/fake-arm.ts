@@ -20,12 +20,10 @@ export interface FakeRule {
 
 export interface FakeServerSeed {
   resourceId: string;
-  /** Normalized or display location. Stored and returned in display form. */
   location: string;
   publicNetworkAccess?: "Enabled" | "Disabled";
   delegatedSubnet?: boolean;
   rules?: FakeRule[];
-  /** Defaults to sync for SQL and async for PostgreSQL, matching the SDKs. */
   lro?: "sync" | "async";
 }
 
@@ -59,11 +57,7 @@ interface FailureRule {
 
 const NAME_PATTERN = /^[0-9A-Za-z_-]{1,128}$/;
 
-/**
- * In-memory ARM stand-in. It rejects malformed requests instead of guessing,
- * overwrites a named rule on PUT (real ARM behavior), and does not treat a
- * confirmation prompt as success. It is not live Azure.
- */
+/** In-memory ARM stand-in. It is not live Azure. */
 export class FakeArm implements HttpTransport {
   readonly requests: HttpRequest[] = [];
   readonly pageSize: number;
@@ -106,7 +100,6 @@ export class FakeArm implements HttpTransport {
     });
   }
 
-  /** Subsequent matching calls return this ARM error and do not mutate. */
   failMatching(
     match: { method?: string; pathIncludes?: string },
     error: { status: number; code?: string | null; message: string },
