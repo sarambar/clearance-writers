@@ -3,7 +3,6 @@
 
 import { createHash } from "node:crypto";
 
-/** SHA-256 hex of a UTF-8 string. */
 export function sha256Hex(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
@@ -54,7 +53,6 @@ export function escapeForOutput(value: string, maxLength = 160): string {
   return `${escaped.slice(0, maxLength)}…`;
 }
 
-/** True when the string is not NFC or contains characters we refuse as input. */
 export function containsDisallowedCharacters(value: string): boolean {
   const normalized = value.normalize("NFC");
   if (normalized !== value) {

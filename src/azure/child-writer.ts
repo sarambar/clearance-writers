@@ -453,10 +453,6 @@ export class AzureChildFirewallWriter implements FirewallWriter {
     return { ok: true, rule, requestId: response.requestId };
   }
 
-  /**
-   * `absent` only on a clean not-found. A failed or unreadable GET is `unknown`
-   * so callers keep treating the rule as applied and the sweeper still runs.
-   */
   private async rulePresence(
     parent: ParsedParent,
     ruleName: string,
