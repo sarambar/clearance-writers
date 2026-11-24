@@ -16,11 +16,8 @@ import {
   UNIMPLEMENTED_SERVICES,
 } from "../src/azure/profiles.js";
 import { containsDisallowedCharacters, sha256Hex } from "../src/codec.js";
-import {
-  CLEARANCE_RULE_PREFIX,
-  MemoryAuditSink,
-  createAzureSqlFirewallWriter,
-} from "../src/index.js";
+import { CLEARANCE_RULE_PREFIX, RULE_NAME, parseRuleName } from "../src/names.js";
+import { MemoryAuditSink, createAzureSqlFirewallWriter } from "../src/index.js";
 import { IP, OTHER_IP, RULE, SQL_ID, TOKEN, addRequest } from "./helpers.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -40,6 +37,12 @@ function walk(directory: string): string[] {
     }
   }
   return found;
+}
+
+function ruleNameBodyMin(pattern: RegExp): number {
+  const match = /\{(\d+),(\d+)\}/.exec(pattern.source);
+  assert.ok(match, pattern.source);
+  return Number(match[1]);
 }
 
 function armClient(handler: (request: HttpRequest) => HttpResponse) {
@@ -81,7 +84,11 @@ describe("encoded constraints", () => {
   it("keeps unimplemented services unimplemented, and pins lro and name floors", () => {
     assert.equal(AZURE_SQL_FIREWALL_PROFILE.lro, "sync");
     assert.equal(AZURE_POSTGRES_FIREWALL_PROFILE.lro, "async");
-    const clearanceMin = CLEARANCE_RULE_PREFIX.length + 8;
+    const bodyMin = ruleNameBodyMin(RULE_NAME);
+    assert.equal(bodyMin, 8);
+    const clearanceMin = CLEARANCE_RULE_PREFIX.length + bodyMin;
+    assert.equal(parseRuleName(`${CLEARANCE_RULE_PREFIX}${"a".repeat(bodyMin)}`).ok, true);
+    assert.equal(parseRuleName(`${CLEARANCE_RULE_PREFIX}${"a".repeat(bodyMin - 1)}`).ok, false);
     assert.ok(clearanceMin > AZURE_SQL_FIREWALL_PROFILE.cloudRuleNameMin);
     assert.ok(clearanceMin > AZURE_POSTGRES_FIREWALL_PROFILE.cloudRuleNameMin);
     for (const service of UNIMPLEMENTED_SERVICES) {
@@ -94,6 +101,14 @@ describe("encoded constraints", () => {
     }
     const redis = UNIMPLEMENTED_SERVICES.find((service) => service.id === "azure-redis-classic-firewall");
     assert.equal(redis?.deleteGuard, "refuse-last-rule");
+  });
+
+  it("exports firewall writer factories only for SQL and PostgreSQL", async () => {
+    const index = await import("../src/index.js");
+    const factories = Object.keys(index)
+      .filter((name) => name.startsWith("create") && name.endsWith("FirewallWriter"))
+      .sort();
+    assert.deepEqual(factories, ["createAzurePostgresFirewallWriter", "createAzureSqlFirewallWriter"]);
   });
 
   it("finishes 200 and 201 writes, polls 202, and fails a 202 with no operation URL", async () => {

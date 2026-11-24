@@ -40,6 +40,7 @@ export interface AzureChildFirewallProfile {
   cloudRuleNameMin: number;
   permissions: readonly string[];
   cli: CliFlagPin;
+  /** What parent read exposes besides the firewall list. */
   knownReadExposure: string | null;
 }
 

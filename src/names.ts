@@ -13,7 +13,7 @@ export const RESERVED_FIREWALL_RULE_NAMES = [
   "AllowAllWindowsAzureIps",
 ] as const;
 
-const RULE_NAME = /^clearance-[0-9A-Za-z_-]{8,118}$/;
+export const RULE_NAME = /^clearance-[0-9A-Za-z_-]{8,118}$/;
 
 export function parseRuleName(
   input: unknown,
