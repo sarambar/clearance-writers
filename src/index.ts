@@ -31,7 +31,16 @@ export { normalizeAzureLocation } from "./location.js";
 
 export { InMemoryFirewallWriter } from "./memory-writer.js";
 
-export { CLEARANCE_RULE_PREFIX, RESERVED_FIREWALL_RULE_NAMES, isClearanceRuleName, parseRuleName } from "./names.js";
+export {
+  CLEARANCE_RULE_PREFIX,
+  RESERVED_FIREWALL_RULE_NAMES,
+  SBC_RULE_PREFIX,
+  isClearanceRuleName,
+  isSbcRuleName,
+  parseRuleName,
+  parseSbcRuleName,
+} from "./names.js";
+export type { ParsedSbcRuleName } from "./names.js";
 
 export {
   POSTGRES_FIREWALL_PROPAGATION_WINDOW_SECONDS,
@@ -43,7 +52,7 @@ export {
 } from "./probe.js";
 export type { ProbeObservation, ReachabilityClass } from "./probe.js";
 
-export { WRITERS_VERSION, writersCommitSha } from "./provenance.js";
+export { WRITERS_VERSION, resolveWritersCommitSha, writersCommitSha } from "./provenance.js";
 
 export type {
   AddRuleRequest,
@@ -61,7 +70,27 @@ export type {
 export { createAzurePostgresFirewallWriter, createAzureSqlFirewallWriter } from "./azure/child-writer.js";
 export type { AzureWriterOptions } from "./azure/child-writer.js";
 
-export { createFetchTransport } from "./azure/http.js";
+export {
+  AZURE_SQL_RULE_PROVIDER_ACTIONS,
+  AzureSqlFirewallRuleProvider,
+  createAzureSqlRuleProvider,
+} from "./azure/sql-provider.js";
+export type {
+  AzureSqlRuleProvider,
+  AzureSqlRuleProviderOptions,
+  SbcRuleView,
+  SqlCloseRuleRequest,
+  SqlCloseRuleValue,
+  SqlListSbcRulesRequest,
+  SqlListSbcRulesValue,
+  SqlOpenRuleRequest,
+  SqlOpenRuleValue,
+  SqlRuleOutcome,
+} from "./azure/sql-provider.js";
+
+export { MAX_LRO_BUDGET_MS, MAX_LRO_POLLS } from "./azure/arm.js";
+
+export { DEFAULT_HTTP_TIMEOUT_MS, createFetchTransport } from "./azure/http.js";
 export type { ArmTokenProvider, HttpTransport } from "./azure/http.js";
 
 export {

@@ -11,8 +11,8 @@ const SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
  * at deploy time. A missing or malformed value is reported as "unknown".
  * Callers cannot pass a SHA into an operation and have it recorded as ours.
  */
-export function writersCommitSha(): string {
-  const raw = process.env.CLEARANCE_WRITERS_COMMIT_SHA;
+export function resolveWritersCommitSha(candidate?: string): string {
+  const raw = candidate ?? (typeof process === "undefined" ? undefined : process.env.CLEARANCE_WRITERS_COMMIT_SHA);
   if (raw === undefined) {
     return "unknown";
   }
@@ -21,4 +21,8 @@ export function writersCommitSha(): string {
     return "unknown";
   }
   return trimmed;
+}
+
+export function writersCommitSha(): string {
+  return resolveWritersCommitSha();
 }

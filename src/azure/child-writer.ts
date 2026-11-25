@@ -40,6 +40,10 @@ export interface AzureWriterOptions {
   endpoint?: string;
   now?: () => Date;
   sleep?: (ms: number) => Promise<void>;
+  /** Pinned commit SHA for audit provenance without mutating process.env. */
+  writersCommitSha?: string;
+  /** Set false when caller persists Retry-After externally without inline sleeping. */
+  inlineThrottleRetry?: boolean;
 }
 
 /**
@@ -56,17 +60,21 @@ export class AzureChildFirewallWriter implements FirewallWriter {
   private readonly arm: ArmClient;
   private readonly auditSink: AuditSink;
   private readonly now: () => Date;
+  private readonly commitSha: string | undefined;
 
   constructor(profile: AzureChildFirewallProfile, options: AzureWriterOptions) {
     this.profile = profile;
     this.descriptor = { id: profile.id, cloud: "azure", listShape: "child-resource" };
     this.auditSink = options.audit;
     this.now = options.now ?? (() => new Date());
+    this.commitSha = options.writersCommitSha;
     this.arm = new ArmClient({
       transport: options.transport,
       tokenProvider: options.tokenProvider,
       endpoint: options.endpoint,
+      now: this.now,
       sleep: options.sleep,
+      inlineThrottleRetry: options.inlineThrottleRetry,
       userAgent: `clearance-writers/${WRITERS_VERSION} (${profile.id})`,
     });
   }
@@ -198,6 +206,9 @@ export class AzureChildFirewallWriter implements FirewallWriter {
       properties: { startIpAddress: wantedStart, endIpAddress: wantedEnd },
     });
     if (!put.ok) {
+      if (put.error.code === "throttled") {
+        return this.failed("add", events, withApplied(put.error, false), fields, false, put.requestId);
+      }
       const presence = await this.rulePresence(parsed.value, validated.value.ruleName, wantedStart, wantedEnd);
       const applied = presence !== "absent";
       return this.failed("add", events, withApplied(put.error, applied), fields, applied, put.requestId);
@@ -585,6 +596,7 @@ export class AzureChildFirewallWriter implements FirewallWriter {
       ruleApplied,
       cloudCode,
       cloudRequestId,
+      writersCommitSha: this.commitSha,
       occurredAt: this.now().toISOString(),
     });
     try {
@@ -618,6 +630,7 @@ function withApplied(error: WriterError, ruleApplied: boolean): WriterError {
     authorizationDenial: error.authorizationDenial,
     cloudCode: error.cloudCode,
     cloudStatus: error.cloudStatus,
+    retryAfterSeconds: error.retryAfterSeconds,
   });
 }
 
