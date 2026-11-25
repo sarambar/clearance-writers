@@ -7,9 +7,10 @@ const SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 /**
  * Git commit this process is actually running.
- * The private backend sets CLEARANCE_WRITERS_COMMIT_SHA to the pinned commit
- * at deploy time. A missing or malformed value is reported as "unknown".
- * Callers cannot pass a SHA into an operation and have it recorded as ours.
+ * The host backend configures the pinned commit once at construction time via
+ * `writersCommitSha` (or deploy-time CLEARANCE_WRITERS_COMMIT_SHA env). A missing
+ * or malformed value is reported as "unknown". Individual rule operations cannot
+ * pass or override the recorded SHA.
  */
 export function resolveWritersCommitSha(candidate?: string): string {
   const raw = candidate ?? (typeof process === "undefined" ? undefined : process.env.CLEARANCE_WRITERS_COMMIT_SHA);

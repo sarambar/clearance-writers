@@ -19,6 +19,7 @@ export const WRITER_ERROR_CODES = [
   "invalid_input",
   "broad_range",
   "azure_services_forbidden",
+  "server_allows_azure_services",
   "default_route_forbidden",
   "not_public_unicast",
   "invalid_rule_name",

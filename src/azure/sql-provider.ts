@@ -144,15 +144,24 @@ function withState(error: WriterError, ruleApplied: boolean, removalVerified = e
   });
 }
 
-type ReadBackViolation = "readback_allow_all" | "readback_azure_services" | "readback_range_rule" | "verify_failed";
+interface ReadBackViolation {
+  code: "verify_failed" | "server_allows_azure_services";
+  detailCode: "readback_allow_all" | "server_allows_azure_services" | "verify_failed";
+  message: string;
+}
 
 /**
- * Inspects every firewall rule returned by ARM (B-T5) without ever reporting
+ * Inspects server firewall rules returned by ARM (B-T5) without ever reporting
  * customer rule names or IP addresses (B-T6).
+ * Legitimate customer rules (including CIDR/IP ranges such as office VPNs) are
+ * ignored completely. Only allow-all (0.0.0.0-255.255.255.255), allow-Azure-services
+ * (0.0.0.0-0.0.0.0 / reserved Azure names), or our own sbc- rule being missing,
+ * mismatched, duplicated, or accompanied by an extra sbc- rule for this lease fail closed.
  */
 function inspectServerRules(
   rules: readonly ParsedFirewallRule[],
   expectedRuleName: string,
+  expectedUlid: string,
   expectedIpv4: string,
 ): ReadBackViolation | null {
   let matchedOwnRule = false;
@@ -161,22 +170,47 @@ function inspectServerRules(
       (reserved) => reserved.toLowerCase() === rule.name.toLowerCase(),
     );
     if (rule.startIpv4 === "0.0.0.0" && rule.endIpv4 === "255.255.255.255") {
-      return "readback_allow_all";
+      return {
+        code: "verify_failed",
+        detailCode: "readback_allow_all",
+        message: "Firewall rule read-back detected an allow-all (0.0.0.0-255.255.255.255) server rule.",
+      };
     }
     if ((rule.startIpv4 === "0.0.0.0" && rule.endIpv4 === "0.0.0.0") || isReservedAzure) {
-      return "readback_azure_services";
-    }
-    if (rule.startIpv4 !== rule.endIpv4) {
-      return "readback_range_rule";
+      return {
+        code: "server_allows_azure_services",
+        detailCode: "server_allows_azure_services",
+        message:
+          "Server firewall allows Azure services (0.0.0.0); Clearance refuses to open rules while Allow Azure Services is enabled.",
+      };
     }
     if (rule.name.toLowerCase() === expectedRuleName.toLowerCase()) {
-      if (rule.startIpv4 !== expectedIpv4 || rule.endIpv4 !== expectedIpv4) {
-        return "verify_failed";
+      if (matchedOwnRule || rule.startIpv4 !== expectedIpv4 || rule.endIpv4 !== expectedIpv4) {
+        return {
+          code: "verify_failed",
+          detailCode: "verify_failed",
+          message: "Firewall rule read-back found a mismatched or duplicate rule for this lease.",
+        };
       }
       matchedOwnRule = true;
+      continue;
+    }
+    const parsedOther = parseSbcRuleName(rule.name);
+    if (parsedOther.ok && parsedOther.value.ulid === expectedUlid) {
+      return {
+        code: "verify_failed",
+        detailCode: "verify_failed",
+        message: "Firewall rule read-back detected an extra sbc- rule for this lease.",
+      };
     }
   }
-  return matchedOwnRule ? null : "verify_failed";
+  return matchedOwnRule
+    ? null
+    : {
+        code: "verify_failed",
+        detailCode: "verify_failed",
+        message: "Firewall rule read-back did not find the created rule.",
+      };
 }
 
 /**
@@ -274,8 +308,17 @@ export class AzureSqlFirewallRuleProvider implements AzureSqlRuleProvider {
     });
     if (!put.ok) {
       if (put.error.code === "throttled") {
-        // ARM rejected the PUT before applying it; do not pin the lease as applied.
-        return this.failed("add", events, withState(put.error, false), fields, false, put.requestId);
+        // A 503 on PUT may still apply in ARM; treat it as possibly applied so the caller sweeps it.
+        if (put.error.cloudStatus === 503) {
+          return this.failed("add", events, withState(put.error, true, false), fields, true, put.requestId);
+        }
+        // On 429, read back the single rule before reporting absence. Only mark removalVerified=true
+        // when ARM explicitly returns 404; if present or unknown, treat as possibly applied.
+        const presence = await this.rulePresence(parsedParent.value, ruleName);
+        if (presence === "absent") {
+          return this.failed("add", events, withState(put.error, false, true), fields, false, put.requestId);
+        }
+        return this.failed("add", events, withState(put.error, true, false), fields, true, put.requestId);
       }
       const presence = await this.rulePresence(parsedParent.value, ruleName);
       const applied = presence !== "absent";
@@ -305,22 +348,22 @@ export class AzureSqlFirewallRuleProvider implements AzureSqlRuleProvider {
       );
     }
 
-    const violation = inspectServerRules(listed.rules, ruleName, wantedIp);
+    const violation = inspectServerRules(listed.rules, ruleName, parsedName.value.ulid, wantedIp);
     if (violation !== null) {
       const rollback = await this.rollbackOwnRule(parsedParent.value, ruleName);
       return this.failed(
         "add",
         events,
         writerError({
-          code: "verify_failed",
-          message: "Firewall rule read-back detected a disallowed server rule state.",
+          code: violation.code,
+          message: violation.message,
           ruleApplied: !rollback.verifiedAbsent,
           removalVerified: rollback.verifiedAbsent,
         }),
         fields,
         !rollback.verifiedAbsent,
         listed.requestId,
-        violation,
+        violation.detailCode,
       );
     }
 

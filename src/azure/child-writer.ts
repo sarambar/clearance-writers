@@ -207,7 +207,15 @@ export class AzureChildFirewallWriter implements FirewallWriter {
     });
     if (!put.ok) {
       if (put.error.code === "throttled") {
-        return this.failed("add", events, withApplied(put.error, false), fields, false, put.requestId);
+        // A 503 on PUT may still apply in ARM; treat it as possibly applied so the caller sweeps it.
+        if (put.error.cloudStatus === 503) {
+          return this.failed("add", events, withApplied(put.error, true, false), fields, true, put.requestId);
+        }
+        const presence = await this.rulePresence(parsed.value, validated.value.ruleName, wantedStart, wantedEnd);
+        if (presence === "absent") {
+          return this.failed("add", events, withApplied(put.error, false, true), fields, false, put.requestId);
+        }
+        return this.failed("add", events, withApplied(put.error, true, false), fields, true, put.requestId);
       }
       const presence = await this.rulePresence(parsed.value, validated.value.ruleName, wantedStart, wantedEnd);
       const applied = presence !== "absent";
@@ -620,13 +628,17 @@ function emptyFields(): AuditFields {
   return { resourceId: null, ruleName: null, ipv4: null, ttlSeconds: null };
 }
 
-function withApplied(error: WriterError, ruleApplied: boolean): WriterError {
+function withApplied(
+  error: WriterError,
+  ruleApplied: boolean,
+  removalVerified: boolean = error.removalVerified,
+): WriterError {
   return writerError({
     code: error.code,
     message: error.message,
     retryable: error.retryable,
     ruleApplied,
-    removalVerified: error.removalVerified,
+    removalVerified,
     authorizationDenial: error.authorizationDenial,
     cloudCode: error.cloudCode,
     cloudStatus: error.cloudStatus,
