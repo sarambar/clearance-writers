@@ -19,6 +19,7 @@ export const WRITER_ERROR_CODES = [
   "invalid_input",
   "broad_range",
   "azure_services_forbidden",
+  "server_allows_azure_services",
   "default_route_forbidden",
   "not_public_unicast",
   "invalid_rule_name",
@@ -66,6 +67,8 @@ export interface WriterErrorOptions {
   authorizationDenial?: boolean;
   cloudCode?: string | null;
   cloudStatus?: number | null;
+  /** Parsed Retry-After delay in seconds when throttled by ARM. */
+  retryAfterSeconds?: number | null;
 }
 
 /**
@@ -80,6 +83,7 @@ export class WriterError extends Error {
   readonly authorizationDenial: boolean;
   readonly cloudCode: string | null;
   readonly cloudStatus: number | null;
+  readonly retryAfterSeconds: number | null;
   /** Operator-facing channel. Do not mix this line into a success payload. */
   readonly stream = "error" as const;
 
@@ -93,6 +97,7 @@ export class WriterError extends Error {
     this.authorizationDenial = options.authorizationDenial ?? false;
     this.cloudCode = options.cloudCode ?? null;
     this.cloudStatus = options.cloudStatus ?? null;
+    this.retryAfterSeconds = options.retryAfterSeconds ?? null;
   }
 
   /** One escaped line for an operator's error stream. */

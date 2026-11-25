@@ -4,7 +4,7 @@
 import { randomUUID } from "node:crypto";
 
 import { canonicalJson, sha256Hex } from "./codec.js";
-import { writersCommitSha, WRITERS_VERSION } from "./provenance.js";
+import { resolveWritersCommitSha, WRITERS_VERSION } from "./provenance.js";
 
 /**
  * Genesis prev-hash for a backend chain. 64 hex zeros.
@@ -78,6 +78,7 @@ export interface AuditDraft {
   ruleApplied?: boolean;
   cloudCode?: string | null;
   cloudRequestId?: string | null;
+  writersCommitSha?: string;
   occurredAt: string;
 }
 
@@ -90,7 +91,7 @@ export function buildAuditEvent(draft: AuditDraft): AuditEvent {
     operation: draft.operation,
     outcome: draft.outcome,
     writersVersion: WRITERS_VERSION,
-    writersCommitSha: writersCommitSha(),
+    writersCommitSha: resolveWritersCommitSha(draft.writersCommitSha),
     service: draft.service,
     detailCode: draft.detailCode,
     resourceId: draft.resourceId,

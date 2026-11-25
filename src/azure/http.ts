@@ -37,11 +37,13 @@ export function headerValue(headers: Record<string, string>, name: string): stri
   return undefined;
 }
 
+export const DEFAULT_HTTP_TIMEOUT_MS = 30_000;
+
 /**
  * Production transport. Redirects are not followed: a 3xx is returned to the
  * caller, which rejects it. A hung socket is aborted.
  */
-export function createFetchTransport(fetchImpl: FetchLike = globalThis.fetch, timeoutMs = 30_000): HttpTransport {
+export function createFetchTransport(fetchImpl: FetchLike = globalThis.fetch, timeoutMs = DEFAULT_HTTP_TIMEOUT_MS): HttpTransport {
   return {
     async send(request: HttpRequest): Promise<HttpResponse> {
       const response = await fetchImpl(request.url, {

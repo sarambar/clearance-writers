@@ -37,7 +37,10 @@ export interface ArmClientOptions {
   transport: HttpTransport;
   tokenProvider: ArmTokenProvider;
   endpoint?: string;
+  now?: () => Date;
   sleep?: (ms: number) => Promise<void>;
+  /** Set false when the caller coordinates Retry-After externally without inline sleeping. */
+  inlineThrottleRetry?: boolean;
   userAgent: string;
 }
 
@@ -45,14 +48,18 @@ export class ArmClient {
   private readonly transport: HttpTransport;
   private readonly tokenProvider: ArmTokenProvider;
   readonly endpoint: string;
+  private readonly now: () => Date;
   private readonly sleep: (ms: number) => Promise<void>;
+  private readonly inlineThrottleRetry: boolean;
   private readonly userAgent: string;
 
   constructor(options: ArmClientOptions) {
     this.transport = options.transport;
     this.tokenProvider = options.tokenProvider;
     this.endpoint = (options.endpoint ?? "https://management.azure.com").replace(/\/$/, "");
+    this.now = options.now ?? (() => new Date());
     this.sleep = options.sleep ?? defaultSleep;
+    this.inlineThrottleRetry = options.inlineThrottleRetry ?? true;
     this.userAgent = options.userAgent;
   }
 
@@ -117,7 +124,7 @@ export class ArmClient {
     const pollUrl = pollTarget.url;
     const source = pollTarget.source;
     let budget = 0;
-    let delay = retryAfterMs(initial.headers) ?? LRO_DEFAULT_DELAY_MS;
+    let delay = retryAfterMs(initial.headers, this.now().getTime()) ?? LRO_DEFAULT_DELAY_MS;
     const successStatuses = source === "location" ? [200, 201, 202, 204] : [200, 202];
     for (let poll = 0; poll < MAX_LRO_POLLS; poll += 1) {
       const remaining = MAX_LRO_BUDGET_MS - budget;
@@ -132,7 +139,7 @@ export class ArmClient {
         return status;
       }
       const state = lroState(status.body);
-      delay = retryAfterMs(status.headers) ?? LRO_DEFAULT_DELAY_MS;
+      delay = retryAfterMs(status.headers, this.now().getTime()) ?? LRO_DEFAULT_DELAY_MS;
       if (state === "failed") {
         const cloud = readError(status.body);
         const closed = publicAccessDisabledError(status.status, cloud);
@@ -246,10 +253,21 @@ export class ArmClient {
           }),
         };
       }
-      if ((response.status === 429 || response.status === 503) && attempt < MAX_HTTP_ATTEMPTS) {
-        const delay = Math.min(retryAfterMs(response.headers) ?? THROTTLE_DEFAULT_DELAY_MS, LRO_MAX_DELAY_MS);
-        await this.sleep(delay);
-        continue;
+      if (response.status === 429 || response.status === 503) {
+        const parsedMs = retryAfterMs(response.headers, this.now().getTime());
+        const delayMs = parsedMs ?? THROTTLE_DEFAULT_DELAY_MS;
+        const retryAfterSeconds = Math.max(1, Math.ceil(delayMs / 1000));
+        if (this.inlineThrottleRetry && attempt < MAX_HTTP_ATTEMPTS) {
+          await this.sleep(Math.min(delayMs, LRO_MAX_DELAY_MS));
+          continue;
+        }
+        const parsed = parseBody(response.body);
+        const cloud = readError(parsed.value);
+        return {
+          ok: false,
+          requestId,
+          error: classifyFailure(response.status, cloud, token, retryAfterSeconds),
+        };
       }
       const parsed = parseBody(response.body);
       if (success.includes(response.status)) {
@@ -276,7 +294,7 @@ export class ArmClient {
       return {
         ok: false,
         requestId,
-        error: classifyFailure(response.status, cloud, token),
+        error: classifyFailure(response.status, cloud, token, null),
       };
     }
     return (
@@ -358,7 +376,7 @@ function resolvePollUrl(candidate: string | undefined, endpoint: string): string
   return target.toString();
 }
 
-function retryAfterMs(headers: Record<string, string>): number | null {
+function retryAfterMs(headers: Record<string, string>, nowMs = Date.now()): number | null {
   const milliseconds = headerValue(headers, "retry-after-ms") ?? headerValue(headers, "x-ms-retry-after-ms");
   if (milliseconds !== undefined && /^[1-9][0-9]{0,8}$/.test(milliseconds.trim())) {
     return Number(milliseconds.trim());
@@ -376,7 +394,7 @@ function retryAfterMs(headers: Record<string, string>): number | null {
   }
   const parsed = Date.parse(trimmed);
   if (!Number.isNaN(parsed)) {
-    const delay = parsed - Date.now();
+    const delay = parsed - nowMs;
     return delay > 0 ? delay : null;
   }
   return null;
@@ -513,6 +531,7 @@ function classifyFailure(
   status: number,
   cloud: { code: string; message: string } | null,
   token: string,
+  retryAfterSeconds: number | null,
 ): WriterError {
   const closed = publicAccessDisabledError(status, cloud);
   if (closed !== null) {
@@ -569,6 +588,7 @@ function classifyFailure(
       cloudStatus: status,
       retryable: true,
       authorizationDenial: false,
+      retryAfterSeconds: retryAfterSeconds ?? 1,
     });
   }
   if (status === 403) {
