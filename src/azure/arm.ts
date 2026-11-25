@@ -18,16 +18,22 @@ export const MAX_RESPONSE_CHARS = 1_000_000;
 
 const REDIRECT = new Set([301, 302, 303, 307, 308]);
 const ARM_AUTHORIZATION_DENIAL = new Set(["AuthorizationFailed", "LinkedAuthorizationFailed"]);
+/** 4xx that do not prove the PUT was rejected. 408/499 are timeouts; 409 includes ARM OperationInterrupted. */
+const UNCERTAIN_CLIENT_STATUS = new Set([408, 409, 499]);
 
 /**
  * Only definite 4xx rejections (or terminal LRO Failed/Canceled) may be downgraded to not-applied
- * via a 404 read-back. Accepted 202 responses, 5xx responses, and transport failures are maybe-applied.
+ * via a 404 read-back. Accepted 202 responses, 5xx responses, transport failures, and
+ * 408/409/499 stay maybe-applied. 400, 401, 403, 404, and 412 stay definite.
  */
 export function isDefinitePutRejection(error: WriterError): boolean {
   if (error.ruleApplied) {
     return false;
   }
   if (error.code === "transport" || error.code === "gateway_error") {
+    return false;
+  }
+  if (error.cloudStatus !== null && UNCERTAIN_CLIENT_STATUS.has(error.cloudStatus)) {
     return false;
   }
   if (error.cloudStatus !== null && error.cloudStatus >= 400 && error.cloudStatus < 500) {

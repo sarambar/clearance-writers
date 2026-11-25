@@ -1325,6 +1325,65 @@ describe("TLA+ audit Slice A regressions", () => {
     }
   });
 
+  it("#2 keeps PUT 408, 499, and 409 maybe-applied (ruleApplied=true) when read-back is 404", async () => {
+    const uncertain: Array<{ status: number; code: string; message: string }> = [
+      { status: 408, code: "RequestTimeout", message: "The request timed out." },
+      { status: 499, code: "ClientClosedRequest", message: "The client closed the request." },
+      { status: 409, code: "OperationInterrupted", message: "Another operation is in progress." },
+    ];
+    for (const tc of uncertain) {
+      const fakeSql = new FakeArm();
+      fakeSql.seedServer({ resourceId: SQL_ID, location: "centralus", rules: [] });
+      fakeSql.failMatching(
+        { method: "PUT", pathIncludes: `/firewallRules/${SBC_RULE}` },
+        { status: tc.status, code: tc.code, message: tc.message },
+        1,
+      );
+      const sqlProvider = createAzureSqlRuleProvider({
+        transport: fakeSql,
+        tokenProvider: { async getToken() { return TOKEN; } },
+        audit: new MemoryAuditSink(),
+        now: () => NOW,
+        sleep: async () => undefined,
+      });
+      const sqlRes = await sqlProvider.openRule({
+        ledgerOwned: true,
+        resourceId: SQL_ID,
+        ruleName: SBC_RULE,
+        ipv4: PUBLIC_IP,
+        ttlSeconds: 600,
+      });
+      assert.equal(sqlRes.ok, false, `sql-provider HTTP ${tc.status}`);
+      if (!sqlRes.ok) {
+        assert.equal(sqlRes.error.cloudStatus, tc.status, `sql-provider HTTP ${tc.status}`);
+        assert.equal(sqlRes.error.ruleApplied, true, `sql-provider HTTP ${tc.status} must stay ruleApplied=true after a 404 read-back`);
+        assert.equal(sqlRes.error.removalVerified, false, `sql-provider HTTP ${tc.status}`);
+      }
+
+      const fakeWriter = new FakeArm();
+      fakeWriter.seedServer({ resourceId: SQL_ID, location: "centralus", rules: [] });
+      fakeWriter.failMatching(
+        { method: "PUT", pathIncludes: `/firewallRules/${RULE}` },
+        { status: tc.status, code: tc.code, message: tc.message },
+        1,
+      );
+      const writer = createAzureSqlFirewallWriter({
+        transport: fakeWriter,
+        tokenProvider: { async getToken() { return TOKEN; } },
+        audit: new MemoryAuditSink(),
+        now: () => NOW,
+        sleep: async () => undefined,
+      });
+      const writerRes = await writer.addRule(addRequest(SQL_ID));
+      assert.equal(writerRes.ok, false, `child-writer HTTP ${tc.status}`);
+      if (!writerRes.ok) {
+        assert.equal(writerRes.error.cloudStatus, tc.status, `child-writer HTTP ${tc.status}`);
+        assert.equal(writerRes.error.ruleApplied, true, `child-writer HTTP ${tc.status} must stay ruleApplied=true after a 404 read-back`);
+        assert.equal(writerRes.error.removalVerified, false, `child-writer HTTP ${tc.status}`);
+      }
+    }
+  });
+
   it("#3 Location-header polling treats non-202 2xx (200 resource body and 204 empty body) as success", async () => {
     // Subcase A: PUT with Location header -> poll 1 returns 202, poll 2 returns 200 with resource body (no status/provisioningState).
     const putOpUrl = `https://management.azure.com/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Sql/locations/centralus/operationResults/op-loc-put`;
