@@ -182,7 +182,7 @@ describe("azure postgres writer", () => {
     const { fake, writer, delays, resourceId } = harness("pg");
     const added = await writer.addRule(addRequest(resourceId));
     assert.equal(added.ok, true);
-    assert.ok(delays.includes(30_000));
+    assert.ok(delays.includes(1_000));
     assert.equal(new URL(fake.requests.find((request) => request.method === "PUT")?.url ?? "https://example.com").searchParams.get("api-version"), AZURE_POSTGRES_FIREWALL_API_VERSION);
     assert.equal(fake.rulesFor(PG_ID)?.length, 1);
     const removed = await writer.removeRule({ resourceId, ruleName: RULE, ledgerOwned: true });

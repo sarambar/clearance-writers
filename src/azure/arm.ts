@@ -5,8 +5,9 @@ import { escapeForOutput } from "../codec.js";
 import { PUBLIC_ACCESS_DISABLED_MESSAGE, writerError, type WriterError } from "../errors.js";
 import { headerValue, sameOriginArmUrl, type ArmTokenProvider, type HttpTransport } from "./http.js";
 
-/** azure-core's default polling interval when Retry-After is absent. */
+/** azure-core's default polling interval cap when Retry-After is absent. */
 export const LRO_DEFAULT_DELAY_MS = 30_000;
+export const LRO_INITIAL_DELAY_MS = 2_000;
 export const LRO_MIN_DELAY_MS = 1_000;
 export const LRO_MAX_DELAY_MS = 30_000;
 export const THROTTLE_DEFAULT_DELAY_MS = 1_000;
@@ -17,14 +18,31 @@ export const MAX_RESPONSE_CHARS = 1_000_000;
 
 const REDIRECT = new Set([301, 302, 303, 307, 308]);
 const ARM_AUTHORIZATION_DENIAL = new Set(["AuthorizationFailed", "LinkedAuthorizationFailed"]);
-const ARM_RULE_LIMIT_CODES = new Set([
-  "toomanyfirewallrules",
-  "firewallrulelimitexceeded",
-  "maxfirewallruleslimitexceeded",
-  "serverfirewallrulelimitexceeded",
-  "maxnumberoffirewallrulesexceeded",
-  "firewallrulequotaexceeded",
-]);
+
+/**
+ * Only definite 4xx rejections (or terminal LRO Failed/Canceled) may be downgraded to not-applied
+ * via a 404 read-back. Accepted 202 responses, 5xx responses, and transport failures are maybe-applied.
+ */
+export function isDefinitePutRejection(error: WriterError): boolean {
+  if (error.ruleApplied) {
+    return false;
+  }
+  if (error.code === "transport" || error.code === "gateway_error") {
+    return false;
+  }
+  if (error.cloudStatus !== null && error.cloudStatus >= 400 && error.cloudStatus < 500) {
+    return true;
+  }
+  if (
+    error.code === "lro_failed" ||
+    error.code === "lro_canceled" ||
+    error.code === "public_access_disabled" ||
+    error.code === "rule_limit_reached"
+  ) {
+    return true;
+  }
+  return false;
+}
 
 interface OperationBudget {
   startedAtMs: number;
@@ -171,7 +189,7 @@ export class ArmClient {
     }
     const pollUrl = pollTarget.url;
     const source = pollTarget.source;
-    let delay = pollDelayMs(initial.headers, this.effectiveNowMs(budget));
+    let delay = pollDelayMs(initial.headers, this.effectiveNowMs(budget), 0);
     const successStatuses = source === "location" ? [200, 201, 202, 204] : [200, 202];
     for (let poll = 0; poll < MAX_LRO_POLLS; poll += 1) {
       const remaining = this.remainingBudgetMs(budget);
@@ -196,11 +214,11 @@ export class ArmClient {
         };
       }
       const state = lroState(status.body);
-      delay = pollDelayMs(status.headers, this.effectiveNowMs(budget));
+      delay = pollDelayMs(status.headers, this.effectiveNowMs(budget), poll + 1);
       if (state === "failed") {
         const cloud = readError(status.body);
         const specific =
-          publicAccessDisabledError(status.status, cloud) ?? ruleLimitReachedError(status.status, cloud, null);
+          publicAccessDisabledError(status.status, cloud) ?? ruleLimitReachedError(status.status, cloud, null, true);
         return {
           ok: false,
           requestId: status.requestId,
@@ -230,6 +248,9 @@ export class ArmClient {
       }
       if (state === "inprogress" || status.status === 202) {
         continue;
+      }
+      if (source === "location" && status.status >= 200 && status.status < 300) {
+        return status;
       }
       return {
         ok: false,
@@ -563,10 +584,11 @@ function retryAfterMs(headers: Record<string, string>, nowMs = Date.now()): numb
   return null;
 }
 
-function pollDelayMs(headers: Record<string, string>, nowMs: number): number {
+function pollDelayMs(headers: Record<string, string>, nowMs: number, pollIndex: number): number {
   const parsed = retryAfterMs(headers, nowMs);
   if (parsed === null) {
-    return LRO_DEFAULT_DELAY_MS;
+    const backoff = LRO_INITIAL_DELAY_MS * Math.pow(2, Math.min(pollIndex, 10));
+    return Math.min(backoff, LRO_MAX_DELAY_MS);
   }
   return Math.min(Math.max(parsed, LRO_MIN_DELAY_MS), LRO_MAX_DELAY_MS);
 }
@@ -727,8 +749,15 @@ function ruleLimitReachedError(
   status: number,
   cloud: { code: string; message: string } | null,
   token: string | null,
+  allowLroStatus = false,
 ): WriterError | null {
-  if (cloud === null || !ruleLimitReached(cloud.code, cloud.message)) {
+  if (cloud === null) {
+    return null;
+  }
+  if (status !== 400 && !(allowLroStatus && status === 200)) {
+    return null;
+  }
+  if (!ruleLimitReached(cloud.code, cloud.message)) {
     return null;
   }
   const cloudCode = cloud.code === "" ? null : safeCloudCode(cloud.code);
@@ -747,17 +776,10 @@ function ruleLimitReachedError(
 }
 
 function ruleLimitReached(code: string, message: string): boolean {
-  if (code !== "" && ARM_RULE_LIMIT_CODES.has(code.toLowerCase())) {
+  if (code === "TooManyFirewallRules") {
     return true;
   }
-  const text = message.toLowerCase();
-  return (
-    text.includes("firewall rules are over the limit") ||
-    text.includes("maximum number of firewall rules") ||
-    text.includes("too many firewall rules") ||
-    text.includes("firewall rule limit") ||
-    /\b256\b.*firewall rule|firewall rule.*\b256\b/.test(text)
-  );
+  return message.toLowerCase().includes("firewall rules are over the limit");
 }
 
 function safeCloudCode(code: string | null): string | null {
@@ -776,10 +798,6 @@ function classifyFailure(
   const closed = publicAccessDisabledError(status, cloud);
   if (closed !== null) {
     return closed;
-  }
-  const limit = ruleLimitReachedError(status, cloud, token);
-  if (limit !== null) {
-    return limit;
   }
   const code = safeCloudCode(cloud?.code ?? null);
   const message = redact(cloud?.message ?? `ARM returned HTTP ${status}.`, token);
@@ -834,6 +852,10 @@ function classifyFailure(
       authorizationDenial: false,
       retryAfterSeconds: retryAfterSeconds ?? 1,
     });
+  }
+  const limit = ruleLimitReachedError(status, cloud, token);
+  if (limit !== null) {
+    return limit;
   }
   if (status === 403) {
     return writerError({

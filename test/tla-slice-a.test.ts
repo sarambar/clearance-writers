@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { ArmClient, LRO_MAX_DELAY_MS, MAX_LRO_BUDGET_MS, MAX_RESPONSE_CHARS } from "../src/azure/arm.js";
+import { ArmClient, LRO_INITIAL_DELAY_MS, LRO_MAX_DELAY_MS, MAX_LRO_BUDGET_MS, MAX_RESPONSE_CHARS } from "../src/azure/arm.js";
 import { FakeArm } from "../src/azure/fake-arm.js";
 import { createFetchTransport, type HttpRequest, type HttpResponse, type HttpTransport } from "../src/azure/http.js";
 import { AZURE_SQL_FIREWALL_PROFILE } from "../src/azure/profiles.js";
@@ -455,11 +455,11 @@ describe("TLA+ audit Slice A regressions", () => {
   });
 
   it("#10 refreshes an expiring JWT mid-poll or aborts as indeterminate when refresh fails", async () => {
-    // Subcase A: JWT expires after 10s, poll sleeps 30s -> provider refreshes on forceRefresh and poll succeeds.
+    // Subcase A: JWT expires after 1s, poll sleeps 2s -> provider refreshes on forceRefresh and poll succeeds.
     const fakeRefresh = new FakeArm();
     fakeRefresh.seedServer({ resourceId: PG_ID, location: "centralus", lro: "async" });
     let clockMs = NOW.getTime();
-    const expiredJwt = makeJwt(Math.floor(clockMs / 1000) + 10);
+    const expiredJwt = makeJwt(Math.floor(clockMs / 1000) + 1);
     const freshJwt = makeJwt(Math.floor(clockMs / 1000) + 3600);
     let currentJwt = expiredJwt;
     let refreshCalls = 0;
@@ -494,7 +494,7 @@ describe("TLA+ audit Slice A regressions", () => {
     const fakeStale = new FakeArm();
     fakeStale.seedServer({ resourceId: PG_ID, location: "centralus", lro: "async" });
     let staleClockMs = NOW.getTime();
-    const staleExpSec = Math.floor(staleClockMs / 1000) + 10;
+    const staleExpSec = Math.floor(staleClockMs / 1000) + 1;
     const alwaysExpiredSoonJwt = makeJwt(staleExpSec);
     let pollSentAfterExpiry = false;
     const staleTransport = wrapFakeArm(fakeStale, async (req, next) => {
@@ -759,7 +759,7 @@ describe("TLA+ audit Slice A regressions", () => {
     fakeRace.seedServer({ resourceId: SQL_ID, location: "centralus", rules: fullRules.slice(0, SQL_RULE_CAP - 1) });
     fakeRace.failMatching(
       { method: "PUT", pathIncludes: `/firewallRules/${RULE}` },
-      { status: 400, code: "FirewallRuleLimitExceeded", message: "Server has exceeded the maximum number of firewall rules (256)." },
+      { status: 400, code: "TooManyFirewallRules", message: "The provided firewall rules are over the limit." },
       1,
     );
     const writer = createAzureSqlFirewallWriter({
@@ -773,8 +773,71 @@ describe("TLA+ audit Slice A regressions", () => {
     assert.equal(raceRes.ok, false);
     if (!raceRes.ok) {
       assert.equal(raceRes.error.code, "rule_limit_reached");
-      assert.equal(raceRes.error.cloudCode, "FirewallRuleLimitExceeded");
+      assert.equal(raceRes.error.cloudCode, "TooManyFirewallRules");
+      assert.equal(raceRes.error.cloudStatus, 400);
       assert.equal(raceRes.error.ruleApplied, false);
+    }
+
+    // Subcase C: 503 with 'firewall rule limit' text must stay throttled with ruleApplied=true (never rule_limit_reached).
+    const fake503 = new FakeArm();
+    fake503.seedServer({ resourceId: SQL_ID, location: "centralus", rules: [] });
+    fake503.failMatching(
+      { method: "PUT", pathIncludes: `/firewallRules/${SBC_RULE}` },
+      {
+        status: 503,
+        code: "ServiceUnavailable",
+        message: "Temporary service error checking firewall rule limit; firewall rules are over the limit.",
+      },
+      1,
+    );
+    const provider503 = createAzureSqlRuleProvider({
+      transport: fake503,
+      tokenProvider: { async getToken() { return TOKEN; } },
+      audit: new MemoryAuditSink(),
+      now: () => NOW,
+      sleep: async () => undefined,
+    });
+    const res503 = await provider503.openRule({
+      ledgerOwned: true,
+      resourceId: SQL_ID,
+      ruleName: SBC_RULE,
+      ipv4: PUBLIC_IP,
+      ttlSeconds: 300,
+    });
+    assert.equal(res503.ok, false);
+    if (!res503.ok) {
+      assert.equal(res503.error.code, "throttled", "503 must stay throttled, never rule_limit_reached");
+      assert.equal(res503.error.cloudStatus, 503);
+      assert.equal(res503.error.ruleApplied, true, "503 PUT must stay ruleApplied=true");
+      assert.equal(res503.error.removalVerified, false);
+    }
+
+    // Subcase D: 429 with TooManyFirewallRules code must stay throttled, never rule_limit_reached.
+    const fake429 = new FakeArm();
+    fake429.seedServer({ resourceId: SQL_ID, location: "centralus", rules: [] });
+    fake429.failMatching(
+      { method: "PUT", pathIncludes: `/firewallRules/${SBC_RULE}` },
+      { status: 429, code: "TooManyFirewallRules", message: "The provided firewall rules are over the limit." },
+      1,
+    );
+    const provider429 = createAzureSqlRuleProvider({
+      transport: fake429,
+      tokenProvider: { async getToken() { return TOKEN; } },
+      audit: new MemoryAuditSink(),
+      now: () => NOW,
+      sleep: async () => undefined,
+    });
+    const res429 = await provider429.openRule({
+      ledgerOwned: true,
+      resourceId: SQL_ID,
+      ruleName: SBC_RULE,
+      ipv4: PUBLIC_IP,
+      ttlSeconds: 300,
+    });
+    assert.equal(res429.ok, false);
+    if (!res429.ok) {
+      assert.equal(res429.error.code, "throttled", "429 must stay throttled, never rule_limit_reached");
+      assert.equal(res429.error.cloudStatus, 429);
     }
   });
 
@@ -989,6 +1052,7 @@ describe("TLA+ audit Slice A regressions", () => {
         }
         pollTimeouts.push(req.timeoutMs);
         pollElapsedAtSend.push(clockMs - NOW.getTime());
+        clockMs += Math.min(5_000, req.timeoutMs ?? 5_000);
         return {
           status: 200,
           headers: { "retry-after": "30" },
@@ -1014,6 +1078,7 @@ describe("TLA+ audit Slice A regressions", () => {
       assert.equal(res.error.ruleApplied, true);
       assert.equal(res.error.removalVerified, false);
     }
+    assert.ok(clockMs - NOW.getTime() <= MAX_LRO_BUDGET_MS, `total elapsed ${clockMs - NOW.getTime()}ms exceeded budget ${MAX_LRO_BUDGET_MS}ms`);
     assert.ok(pollElapsedAtSend.length > 0);
     for (let i = 0; i < pollElapsedAtSend.length; i += 1) {
       const elapsed = pollElapsedAtSend[i] ?? MAX_LRO_BUDGET_MS;
@@ -1129,5 +1194,355 @@ describe("TLA+ audit Slice A regressions", () => {
         assert.equal(outcome.error.removalVerified, true, "verified rollback removal must preserve removalVerified=true");
       }
     }
+  });
+
+  it("#2 treats PUT 5xx, 504, and transport timeout as maybe-applied (ruleApplied=true) even when read-back returns 404", async () => {
+    const uncertainCases: Array<{
+      label: string;
+      handlePut: () => Promise<HttpResponse>;
+      expectedCode: string;
+    }> = [
+      {
+        label: "HTTP 500",
+        handlePut: async () => ({
+          status: 500,
+          headers: {},
+          body: JSON.stringify({ error: { code: "InternalServerError", message: "transient failure" } }),
+        }),
+        expectedCode: "transport",
+      },
+      {
+        label: "HTTP 502",
+        handlePut: async () => ({
+          status: 502,
+          headers: {},
+          body: JSON.stringify({ error: { code: "BadGateway", message: "bad gateway" } }),
+        }),
+        expectedCode: "gateway_error",
+      },
+      {
+        label: "HTTP 504",
+        handlePut: async () => ({
+          status: 504,
+          headers: {},
+          body: JSON.stringify({ error: { code: "GatewayTimeout", message: "gateway timeout" } }),
+        }),
+        expectedCode: "transport",
+      },
+      {
+        label: "transport timeout",
+        handlePut: async () => {
+          throw new Error("The operation was aborted due to timeout");
+        },
+        expectedCode: "transport",
+      },
+    ];
+
+    for (const tc of uncertainCases) {
+      // AzureSqlRuleProvider: PUT hits uncertain 5xx/transport; rule is still absent on read-back (404).
+      const fakeSql = new FakeArm();
+      fakeSql.seedServer({ resourceId: SQL_ID, location: "centralus", rules: [] });
+      const sqlTransport = wrapFakeArm(fakeSql, async (req, next) => {
+        if (req.method === "PUT") {
+          return tc.handlePut();
+        }
+        return next();
+      });
+      const sqlAudit = new MemoryAuditSink();
+      const sqlProvider = createAzureSqlRuleProvider({
+        transport: sqlTransport,
+        tokenProvider: { async getToken() { return TOKEN; } },
+        audit: sqlAudit,
+        now: () => NOW,
+        sleep: async () => undefined,
+      });
+      const sqlRes = await sqlProvider.openRule({
+        ledgerOwned: true,
+        resourceId: SQL_ID,
+        ruleName: SBC_RULE,
+        ipv4: PUBLIC_IP,
+        ttlSeconds: 600,
+      });
+      assert.equal(sqlRes.ok, false, `sql-provider ${tc.label}`);
+      if (!sqlRes.ok) {
+        assert.equal(sqlRes.error.code, tc.expectedCode, `sql-provider ${tc.label}`);
+        assert.equal(sqlRes.error.ruleApplied, true, `sql-provider ${tc.label} must remain ruleApplied=true despite 404`);
+        assert.equal(sqlRes.error.removalVerified, false, `sql-provider ${tc.label} must remain removalVerified=false`);
+      }
+
+      // AzureChildFirewallWriter: same uncertain 5xx/transport; rule is absent on read-back (404).
+      const fakeWriter = new FakeArm();
+      fakeWriter.seedServer({ resourceId: SQL_ID, location: "centralus", rules: [] });
+      const writerTransport = wrapFakeArm(fakeWriter, async (req, next) => {
+        if (req.method === "PUT") {
+          return tc.handlePut();
+        }
+        return next();
+      });
+      const writerAudit = new MemoryAuditSink();
+      const writer = createAzureSqlFirewallWriter({
+        transport: writerTransport,
+        tokenProvider: { async getToken() { return TOKEN; } },
+        audit: writerAudit,
+        now: () => NOW,
+        sleep: async () => undefined,
+      });
+      const writerRes = await writer.addRule(addRequest(SQL_ID));
+      assert.equal(writerRes.ok, false, `child-writer ${tc.label}`);
+      if (!writerRes.ok) {
+        assert.equal(writerRes.error.code, tc.expectedCode, `child-writer ${tc.label}`);
+        assert.equal(writerRes.error.ruleApplied, true, `child-writer ${tc.label} must remain ruleApplied=true despite 404`);
+        assert.equal(writerRes.error.removalVerified, false, `child-writer ${tc.label} must remain removalVerified=false`);
+      }
+    }
+
+    // Contrast: definite 400 rejection + 404 read-back still reports ruleApplied=false.
+    const fake400 = new FakeArm();
+    fake400.seedServer({ resourceId: SQL_ID, location: "centralus", rules: [] });
+    fake400.failMatching(
+      { method: "PUT", pathIncludes: `/firewallRules/${SBC_RULE}` },
+      { status: 400, code: "InvalidRequest", message: "invalid ip" },
+      1,
+    );
+    const provider400 = createAzureSqlRuleProvider({
+      transport: fake400,
+      tokenProvider: { async getToken() { return TOKEN; } },
+      audit: new MemoryAuditSink(),
+      now: () => NOW,
+      sleep: async () => undefined,
+    });
+    const res400 = await provider400.openRule({
+      ledgerOwned: true,
+      resourceId: SQL_ID,
+      ruleName: SBC_RULE,
+      ipv4: PUBLIC_IP,
+      ttlSeconds: 600,
+    });
+    assert.equal(res400.ok, false);
+    if (!res400.ok) {
+      assert.equal(res400.error.code, "cloud_rejected");
+      assert.equal(res400.error.ruleApplied, false);
+    }
+  });
+
+  it("#3 Location-header polling treats non-202 2xx (200 resource body and 204 empty body) as success", async () => {
+    // Subcase A: PUT with Location header -> poll 1 returns 202, poll 2 returns 200 with resource body (no status/provisioningState).
+    const putOpUrl = `https://management.azure.com/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Sql/locations/centralus/operationResults/op-loc-put`;
+    let putPolls = 0;
+    const putArm = new ArmClient({
+      transport: {
+        async send(req: HttpRequest): Promise<HttpResponse> {
+          if (req.method === "PUT") {
+            return {
+              status: 202,
+              headers: { location: putOpUrl, "retry-after": "1" },
+              body: "",
+            };
+          }
+          putPolls += 1;
+          if (putPolls === 1) {
+            return { status: 202, headers: { "retry-after": "1" }, body: "" };
+          }
+          return {
+            status: 200,
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              id: `${SQL_ID}/firewallRules/${SBC_RULE}`,
+              name: SBC_RULE,
+              properties: { startIpAddress: PUBLIC_IP, endIpAddress: PUBLIC_IP },
+            }),
+          };
+        },
+      },
+      tokenProvider: { async getToken() { return TOKEN; } },
+      userAgent: "test-agent",
+      now: () => NOW,
+      sleep: async () => undefined,
+    });
+    const putResult = await putArm.put(`${SQL_ID}/firewallRules/${SBC_RULE}`, AZURE_SQL_FIREWALL_PROFILE.apiVersion, {
+      properties: { startIpAddress: PUBLIC_IP, endIpAddress: PUBLIC_IP },
+    });
+    assert.equal(putResult.ok, true, "Location poll ending with 200+resource body must succeed");
+    assert.equal(putPolls, 2);
+
+    // Subcase B: DELETE with Location header -> poll 1 returns 202, poll 2 returns 204 No Content.
+    const delOpUrl = `https://management.azure.com/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Sql/locations/centralus/operationResults/op-loc-del`;
+    let delPolls = 0;
+    const delArm = new ArmClient({
+      transport: {
+        async send(req: HttpRequest): Promise<HttpResponse> {
+          if (req.method === "DELETE") {
+            return {
+              status: 202,
+              headers: { location: delOpUrl, "retry-after": "1" },
+              body: "",
+            };
+          }
+          delPolls += 1;
+          if (delPolls === 1) {
+            return { status: 202, headers: { "retry-after": "1" }, body: "" };
+          }
+          return { status: 204, headers: {}, body: "" };
+        },
+      },
+      tokenProvider: { async getToken() { return TOKEN; } },
+      userAgent: "test-agent",
+      now: () => NOW,
+      sleep: async () => undefined,
+    });
+    const delResult = await delArm.delete(`${SQL_ID}/firewallRules/${SBC_RULE}`, AZURE_SQL_FIREWALL_PROFILE.apiVersion);
+    assert.equal(delResult.ok, true, "Location poll ending with 204 must succeed");
+    assert.equal(delPolls, 2);
+  });
+
+  it("#7 closeRule and removeRule report alreadyAbsent=false (removed) when DELETE 202 poll fails and read-back shows absent", async () => {
+    // Subcase A: sql-provider.closeRule — DELETE accepted (202), rule actually deleted, poll returns 500 -> read-back 404 -> removed (alreadyAbsent=false).
+    const fakeSql = new FakeArm();
+    fakeSql.seedServer({
+      resourceId: SQL_ID,
+      location: "centralus",
+      lro: "async",
+      rules: [{ name: SBC_RULE, startIpv4: PUBLIC_IP, endIpv4: PUBLIC_IP }],
+    });
+    const sqlTransport = wrapFakeArm(fakeSql, async (req, next) => {
+      if (req.method === "GET" && req.url.includes("/operationResults/")) {
+        // Drain FakeArm's background delete, then report the poll as a 500.
+        await next();
+        await next();
+        return {
+          status: 500,
+          headers: {},
+          body: JSON.stringify({ error: { code: "InternalServerError", message: "poll failed" } }),
+        };
+      }
+      return next();
+    });
+    const sqlProvider = createAzureSqlRuleProvider({
+      transport: sqlTransport,
+      tokenProvider: { async getToken() { return TOKEN; } },
+      audit: new MemoryAuditSink(),
+      now: () => NOW,
+      sleep: async () => undefined,
+    });
+    const closed = await sqlProvider.closeRule({
+      ledgerOwned: true,
+      resourceId: SQL_ID,
+      ruleName: SBC_RULE,
+    });
+    assert.equal(closed.ok, true);
+    if (closed.ok) {
+      assert.equal(closed.value.removalVerified, true);
+      assert.equal(closed.value.alreadyAbsent, false, "accepted DELETE whose poll failed must report removed (alreadyAbsent=false)");
+    }
+
+    // Subcase B: child-writer.removeRule — DELETE accepted (202), poll returns 500 -> read-back 404 -> removed (alreadyAbsent=false).
+    const fakeWriter = new FakeArm();
+    fakeWriter.seedServer({
+      resourceId: PG_ID,
+      location: "centralus",
+      lro: "async",
+      rules: [{ name: RULE, startIpv4: IP, endIpv4: IP }],
+    });
+    const writerTransport = wrapFakeArm(fakeWriter, async (req, next) => {
+      if (req.method === "GET" && req.url.includes("/operationResults/")) {
+        // Drain FakeArm's background delete, then report the poll as a 500.
+        await next();
+        await next();
+        return {
+          status: 500,
+          headers: {},
+          body: JSON.stringify({ error: { code: "InternalServerError", message: "poll failed" } }),
+        };
+      }
+      return next();
+    });
+    const writer = createAzurePostgresFirewallWriter({
+      transport: writerTransport,
+      tokenProvider: { async getToken() { return TOKEN; } },
+      audit: new MemoryAuditSink(),
+      now: () => NOW,
+      sleep: async () => undefined,
+    });
+    const removed = await writer.removeRule({
+      ledgerOwned: true,
+      resourceId: PG_ID,
+      ruleName: RULE,
+    });
+    assert.equal(removed.ok, true);
+    if (removed.ok) {
+      assert.equal(removed.value.removalVerified, true);
+      assert.equal(removed.value.alreadyAbsent, false, "accepted DELETE whose poll failed must report removed (alreadyAbsent=false)");
+    }
+  });
+
+  it("#8 default no-Retry-After poll delay starts at 2s with exponential backoff capped at 30s and honors Retry-After with 1s floor", async () => {
+    const opUrl = `https://management.azure.com/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Sql/locations/centralus/operationResults/op-backoff`;
+    // Subcase A: No Retry-After -> 2s, 4s, 8s, 16s, 30s, 30s then Succeeded.
+    let backoffPoll = 0;
+    const backoffDelays: number[] = [];
+    const armBackoff = new ArmClient({
+      transport: {
+        async send(req: HttpRequest): Promise<HttpResponse> {
+          if (req.method === "PUT") {
+            return { status: 202, headers: { "azure-asyncoperation": opUrl }, body: JSON.stringify({ status: "InProgress" }) };
+          }
+          backoffPoll += 1;
+          return {
+            status: 200,
+            headers: {},
+            body: JSON.stringify({ status: backoffPoll >= 6 ? "Succeeded" : "InProgress" }),
+          };
+        },
+      },
+      tokenProvider: { async getToken() { return TOKEN; } },
+      userAgent: "test-agent",
+      now: () => NOW,
+      sleep: async (ms) => {
+        backoffDelays.push(ms);
+      },
+    });
+    const backoffRes = await armBackoff.put(`${SQL_ID}/firewallRules/${SBC_RULE}`, AZURE_SQL_FIREWALL_PROFILE.apiVersion, {
+      properties: { startIpAddress: PUBLIC_IP, endIpAddress: PUBLIC_IP },
+    });
+    assert.equal(backoffRes.ok, true);
+    assert.deepEqual(backoffDelays, [LRO_INITIAL_DELAY_MS, 4_000, 8_000, 16_000, 30_000, 30_000]);
+
+    // Subcase B: Honors Retry-After with 1s floor and 30s ceiling.
+    const retryAfterHeaders = ["0", "5", "60"];
+    let headerPoll = 0;
+    const headerDelays: number[] = [];
+    const armHeaders = new ArmClient({
+      transport: {
+        async send(req: HttpRequest): Promise<HttpResponse> {
+          if (req.method === "PUT") {
+            return {
+              status: 202,
+              headers: { "azure-asyncoperation": opUrl, "retry-after": retryAfterHeaders[0] ?? "0" },
+              body: JSON.stringify({ status: "InProgress" }),
+            };
+          }
+          headerPoll += 1;
+          if (headerPoll >= retryAfterHeaders.length) {
+            return { status: 200, headers: {}, body: JSON.stringify({ status: "Succeeded" }) };
+          }
+          return {
+            status: 200,
+            headers: { "retry-after": retryAfterHeaders[headerPoll] ?? "5" },
+            body: JSON.stringify({ status: "InProgress" }),
+          };
+        },
+      },
+      tokenProvider: { async getToken() { return TOKEN; } },
+      userAgent: "test-agent",
+      now: () => NOW,
+      sleep: async (ms) => {
+        headerDelays.push(ms);
+      },
+    });
+    const headersRes = await armHeaders.put(`${SQL_ID}/firewallRules/${SBC_RULE}`, AZURE_SQL_FIREWALL_PROFILE.apiVersion, {
+      properties: { startIpAddress: PUBLIC_IP, endIpAddress: PUBLIC_IP },
+    });
+    assert.equal(headersRes.ok, true);
+    assert.deepEqual(headerDelays, [1_000, 5_000, 30_000]);
   });
 });

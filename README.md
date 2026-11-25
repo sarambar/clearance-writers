@@ -49,7 +49,7 @@ ARM API version `2026-08-01-preview`, the default of `azure-mgmt-sql` 5.0.0b2, w
 
 CLI flags this REST call corresponds to: `--resource-group`/`-g`, `--server`/`-s`, `--name`/`-n`, `--start-ip-address`, `--end-ip-address`. The server flag is not `--server-name` and not `-n`.
 
-Server-level cap used by the adapter: 256 rules, counted before create (`rule_cap_exceeded`). If ARM rejects a create because the server is already at the 256-rule limit (for example in `AzureSqlFirewallRuleProvider` or under a concurrent write), the error is mapped to `rule_limit_reached`. Delete is not refused because of the cap. Official docs describe up to a five-minute firewall cache after a change. Control-plane absence is not "closed at".
+Server-level cap used by the adapter: 256 rules, counted before create (`rule_cap_exceeded`). If ARM rejects a create with HTTP 400 and code `TooManyFirewallRules` (or the documented "firewall rules are over the limit" message), the error is mapped to `rule_limit_reached`. HTTP 429, 503, and other 5xx responses stay `throttled` or transport failures and are treated as maybe-applied. Delete is not refused because of the cap. Official docs describe up to a five-minute firewall cache after a change. Control-plane absence is not "closed at".
 
 ### PostgreSQL Flexible Server
 

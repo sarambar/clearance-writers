@@ -6,7 +6,7 @@ import { writerError, type WriterError } from "../errors.js";
 import { parseAllowAddress, parseIpv4, parseTtlSeconds, STRICT_IP_POLICY } from "../ip.js";
 import { parseSbcRuleName, RESERVED_FIREWALL_RULE_NAMES } from "../names.js";
 import { WRITERS_VERSION } from "../provenance.js";
-import { ArmClient, type ArmCall } from "./arm.js";
+import { ArmClient, isDefinitePutRejection, type ArmCall } from "./arm.js";
 import type { ArmTokenProvider, HttpTransport } from "./http.js";
 import {
   AZURE_SQL_FIREWALL_PROFILE,
@@ -312,14 +312,10 @@ export class AzureSqlFirewallRuleProvider implements AzureSqlRuleProvider {
       properties: { startIpAddress: wantedIp, endIpAddress: wantedIp },
     });
     if (!put.ok) {
-      if (put.error.ruleApplied || put.error.cloudStatus === 202) {
+      if (!isDefinitePutRejection(put.error)) {
         return this.failed("add", events, withState(put.error, true, false), fields, true, put.requestId);
       }
       if (put.error.code === "throttled") {
-        // A 503 on PUT may still apply in ARM; treat it as possibly applied so the caller sweeps it.
-        if (put.error.cloudStatus === 503) {
-          return this.failed("add", events, withState(put.error, true, false), fields, true, put.requestId);
-        }
         // On 429, read back the single rule before reporting absence. Only mark removalVerified=true
         // when ARM explicitly returns 404; if present or unknown, treat as possibly applied.
         const presence = await this.rulePresence(parsedParent.value, ruleName);
@@ -421,14 +417,15 @@ export class AzureSqlFirewallRuleProvider implements AzureSqlRuleProvider {
     const deleted = await this.arm.delete(path, AZURE_SQL_FIREWALL_PROFILE.apiVersion);
     let alreadyAbsent = false;
     if (!deleted.ok) {
-      if (deleted.error.code === "not_found") {
+      const deleteAccepted = deleted.error.ruleApplied || deleted.error.cloudStatus === 202;
+      if (deleted.error.code === "not_found" && !deleteAccepted) {
         alreadyAbsent = true;
-      } else if (deleted.error.code === "throttled") {
+      } else if (deleted.error.code === "throttled" && !deleteAccepted) {
         return this.failed("remove", events, withState(deleted.error, true), fields, true, deleted.requestId);
       } else {
         const presence = await this.rulePresence(parsedParent.value, ruleName);
         if (presence === "absent") {
-          alreadyAbsent = true;
+          alreadyAbsent = !deleteAccepted;
         } else {
           return this.failed("remove", events, withState(deleted.error, true), fields, true, deleted.requestId);
         }

@@ -20,7 +20,7 @@ import type {
   WriterDescriptor,
   WriterOutcome,
 } from "../writer.js";
-import { ArmClient, type ArmCall } from "./arm.js";
+import { ArmClient, isDefinitePutRejection, type ArmCall } from "./arm.js";
 import type { ArmTokenProvider, HttpTransport } from "./http.js";
 import { DELETE_VERIFY_BASE_DELAY_MS, DELETE_VERIFY_MAX_ATTEMPTS } from "./sql-provider.js";
 import {
@@ -212,14 +212,10 @@ export class AzureChildFirewallWriter implements FirewallWriter {
       properties: { startIpAddress: wantedStart, endIpAddress: wantedEnd },
     });
     if (!put.ok) {
-      if (put.error.ruleApplied || put.error.cloudStatus === 202) {
+      if (!isDefinitePutRejection(put.error)) {
         return this.failed("add", events, withApplied(put.error, true, false), fields, true, put.requestId);
       }
       if (put.error.code === "throttled") {
-        // A 503 on PUT may still apply in ARM; treat it as possibly applied so the caller sweeps it.
-        if (put.error.cloudStatus === 503) {
-          return this.failed("add", events, withApplied(put.error, true, false), fields, true, put.requestId);
-        }
         const presence = await this.rulePresence(parsed.value, validated.value.ruleName, wantedStart, wantedEnd);
         if (presence === "absent") {
           return this.failed("add", events, withApplied(put.error, false, true), fields, false, put.requestId);
@@ -322,15 +318,20 @@ export class AzureChildFirewallWriter implements FirewallWriter {
         childPath(this.profile, parsed.value, validated.value.ruleName),
         this.profile.apiVersion,
       );
-      if (!deleted.ok && deleted.error.code !== "not_found") {
-        const presence = await this.rulePresence(parsed.value, validated.value.ruleName);
-        if (presence === "absent") {
+      if (!deleted.ok) {
+        const deleteAccepted = deleted.error.ruleApplied || deleted.error.cloudStatus === 202;
+        if (deleted.error.code === "not_found" && !deleteAccepted) {
           alreadyAbsent = true;
         } else {
-          return this.failed("remove", events, withApplied(deleted.error, true), fields, true, deleted.requestId);
+          const presence = await this.rulePresence(parsed.value, validated.value.ruleName);
+          if (presence === "absent") {
+            alreadyAbsent = !deleteAccepted;
+          } else {
+            return this.failed("remove", events, withApplied(deleted.error, true), fields, true, deleted.requestId);
+          }
         }
       } else {
-        alreadyAbsent = deleted.ok === false;
+        alreadyAbsent = false;
       }
     }
     const verified = await this.verifyRuleAbsent(parsed.value, validated.value.ruleName);
