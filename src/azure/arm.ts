@@ -178,9 +178,15 @@ export class ArmClient {
       if (remaining <= 0) {
         break;
       }
-      const wait = Math.min(delay, LRO_MAX_DELAY_MS, remaining);
+      const wait = Math.min(delay, LRO_MAX_DELAY_MS);
+      if (wait >= remaining) {
+        break;
+      }
       budget.sleptMs += wait;
       await this.sleep(wait);
+      if (this.remainingBudgetMs(budget) <= 0) {
+        break;
+      }
       const status = await this.request("GET", pollUrl, undefined, successStatuses, budget, true);
       if (!status.ok) {
         return {
@@ -263,10 +269,44 @@ export class ArmClient {
     let authRefreshed = false;
     let forcedToken: string | null = null;
     for (let attempt = 1; attempt <= MAX_HTTP_ATTEMPTS; attempt += 1) {
+      const remainingBeforeSend = this.remainingBudgetMs(budget);
+      if (remainingBeforeSend <= 0) {
+        return (
+          last ?? {
+            ok: false,
+            requestId: null,
+            error: writerError({
+              code: "lro_timeout",
+              message: "The long-running operation did not finish before the poll budget.",
+              retryable: true,
+              cloudStatus: allowAuthRefresh ? 202 : null,
+              ruleApplied: allowAuthRefresh,
+              removalVerified: false,
+            }),
+          }
+        );
+      }
       const token: string | ArmFailure = forcedToken ?? (await this.acquireToken(budget, false));
       forcedToken = null;
       if (typeof token !== "string") {
         return token;
+      }
+      const remainingForTransport = this.remainingBudgetMs(budget);
+      if (remainingForTransport <= 0) {
+        return (
+          last ?? {
+            ok: false,
+            requestId: null,
+            error: writerError({
+              code: "lro_timeout",
+              message: "The long-running operation did not finish before the poll budget.",
+              retryable: true,
+              cloudStatus: allowAuthRefresh ? 202 : null,
+              ruleApplied: allowAuthRefresh,
+              removalVerified: false,
+            }),
+          }
+        );
       }
       let response;
       try {
@@ -274,6 +314,7 @@ export class ArmClient {
           method,
           url,
           body,
+          timeoutMs: remainingForTransport,
           headers: {
             authorization: `Bearer ${token}`,
             accept: "application/json",
@@ -292,12 +333,13 @@ export class ArmClient {
             retryable: method === "GET",
           }),
         };
-        if (method === "GET" && attempt < MAX_HTTP_ATTEMPTS) {
+        if (method === "GET" && attempt < MAX_HTTP_ATTEMPTS && this.remainingBudgetMs(budget) > 0) {
           continue;
         }
         return last;
       }
       const requestId = headerValue(response.headers, "x-ms-request-id") ?? null;
+      const acceptedPut = method === "PUT" && success.includes(response.status);
       if (REDIRECT.has(response.status)) {
         return {
           ok: false,
@@ -317,16 +359,19 @@ export class ArmClient {
             code: "cloud_response_invalid",
             message: "ARM response exceeded the size limit.",
             cloudStatus: response.status,
+            ...(acceptedPut ? { ruleApplied: true, removalVerified: false } : {}),
           }),
         };
       }
       if (response.status === 401 && allowAuthRefresh && !authRefreshed) {
         authRefreshed = true;
-        const refreshed = await this.acquireToken(budget, true);
-        if (typeof refreshed === "string" && refreshed !== token) {
-          forcedToken = refreshed;
-          attempt -= 1;
-          continue;
+        if (this.remainingBudgetMs(budget) > 0) {
+          const refreshed = await this.acquireToken(budget, true);
+          if (typeof refreshed === "string" && refreshed !== token) {
+            forcedToken = refreshed;
+            attempt -= 1;
+            continue;
+          }
         }
       }
       if (response.status === 429 || response.status === 503) {
@@ -335,7 +380,7 @@ export class ArmClient {
         const retryAfterSeconds = Math.max(1, Math.ceil(delayMs / 1000));
         if (method !== "PUT" && this.inlineThrottleRetry && attempt < MAX_HTTP_ATTEMPTS) {
           const retryWait = Math.min(Math.max(delayMs, THROTTLE_DEFAULT_DELAY_MS), LRO_MAX_DELAY_MS);
-          if (this.remainingBudgetMs(budget) >= retryWait) {
+          if (this.remainingBudgetMs(budget) > retryWait) {
             budget.sleptMs += retryWait;
             await this.sleep(retryWait);
             continue;
@@ -359,6 +404,7 @@ export class ArmClient {
               code: "cloud_response_invalid",
               message: "ARM success response was not JSON.",
               cloudStatus: response.status,
+              ...(acceptedPut ? { ruleApplied: true, removalVerified: false } : {}),
             }),
           };
         }

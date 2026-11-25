@@ -6,6 +6,7 @@ export interface HttpRequest {
   url: string;
   headers: Record<string, string>;
   body?: string;
+  timeoutMs?: number;
 }
 
 export interface HttpResponse {
@@ -46,12 +47,16 @@ export const DEFAULT_HTTP_TIMEOUT_MS = 30_000;
 export function createFetchTransport(fetchImpl: FetchLike = globalThis.fetch, timeoutMs = DEFAULT_HTTP_TIMEOUT_MS): HttpTransport {
   return {
     async send(request: HttpRequest): Promise<HttpResponse> {
+      const effectiveTimeoutMs =
+        request.timeoutMs !== undefined && Number.isFinite(request.timeoutMs) && request.timeoutMs > 0
+          ? Math.min(timeoutMs, request.timeoutMs)
+          : timeoutMs;
       const response = await fetchImpl(request.url, {
         method: request.method,
         headers: request.headers,
         body: request.body,
         redirect: "manual",
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: AbortSignal.timeout(effectiveTimeoutMs),
       });
       const headers: Record<string, string> = {};
       response.headers.forEach((value, key) => {

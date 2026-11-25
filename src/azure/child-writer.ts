@@ -212,7 +212,7 @@ export class AzureChildFirewallWriter implements FirewallWriter {
       properties: { startIpAddress: wantedStart, endIpAddress: wantedEnd },
     });
     if (!put.ok) {
-      if (put.error.ruleApplied) {
+      if (put.error.ruleApplied || put.error.cloudStatus === 202) {
         return this.failed("add", events, withApplied(put.error, true, false), fields, true, put.requestId);
       }
       if (put.error.code === "throttled") {

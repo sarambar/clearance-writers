@@ -4,9 +4,9 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { ArmClient, LRO_MAX_DELAY_MS, MAX_LRO_BUDGET_MS } from "../src/azure/arm.js";
+import { ArmClient, LRO_MAX_DELAY_MS, MAX_LRO_BUDGET_MS, MAX_RESPONSE_CHARS } from "../src/azure/arm.js";
 import { FakeArm } from "../src/azure/fake-arm.js";
-import type { HttpRequest, HttpResponse, HttpTransport } from "../src/azure/http.js";
+import { createFetchTransport, type HttpRequest, type HttpResponse, type HttpTransport } from "../src/azure/http.js";
 import { AZURE_SQL_FIREWALL_PROFILE } from "../src/azure/profiles.js";
 import {
   InMemoryFirewallWriter,
@@ -889,5 +889,245 @@ describe("TLA+ audit Slice A regressions", () => {
       memRemoved.audit.map((e) => `${e.operation}:${e.phase}`),
       ["remove:intent", "remove:result"],
     );
+  });
+
+  it("#1 preserves ruleApplied=true and removalVerified=false when initial 202 PUT body is invalid JSON or oversized", async () => {
+    const cases: Array<{ label: string; body: string }> = [
+      { label: "invalid JSON", body: "<html>Accepted</html>" },
+      { label: "oversized body", body: "x".repeat(MAX_RESPONSE_CHARS + 1) },
+    ];
+
+    for (const testCase of cases) {
+      // AzureSqlRuleProvider: 202 with bad body, rule not yet visible on read-back (404).
+      const fakeSql = new FakeArm();
+      fakeSql.seedServer({ resourceId: SQL_ID, location: "centralus", rules: [] });
+      const sqlTransport = wrapFakeArm(fakeSql, async (req, next) => {
+        if (req.method === "PUT") {
+          return {
+            status: 202,
+            headers: {
+              "azure-asyncoperation": `https://management.azure.com/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Sql/locations/centralus/operationResults/op-bad-202`,
+              "x-ms-request-id": "req-bad-202-sql",
+            },
+            body: testCase.body,
+          };
+        }
+        return next();
+      });
+      const sqlAudit = new MemoryAuditSink();
+      const sqlProvider = createAzureSqlRuleProvider({
+        transport: sqlTransport,
+        tokenProvider: { async getToken() { return TOKEN; } },
+        audit: sqlAudit,
+        now: () => NOW,
+        sleep: async () => undefined,
+      });
+      const sqlOutcome = await sqlProvider.openRule({
+        ledgerOwned: true,
+        resourceId: SQL_ID,
+        ruleName: SBC_RULE,
+        ipv4: PUBLIC_IP,
+        ttlSeconds: 600,
+      });
+      assert.equal(sqlOutcome.ok, false, `sql-provider ${testCase.label}`);
+      if (!sqlOutcome.ok) {
+        assert.equal(sqlOutcome.error.code, "cloud_response_invalid", `sql-provider ${testCase.label}`);
+        assert.equal(sqlOutcome.error.cloudStatus, 202, `sql-provider ${testCase.label}`);
+        assert.equal(sqlOutcome.error.ruleApplied, true, `sql-provider ${testCase.label} must preserve ruleApplied=true`);
+        assert.equal(sqlOutcome.error.removalVerified, false, `sql-provider ${testCase.label} must keep removalVerified=false`);
+      }
+
+      // AzureChildFirewallWriter: 202 with bad body, rule not yet visible on read-back (404).
+      const fakePg = new FakeArm();
+      fakePg.seedServer({ resourceId: PG_ID, location: "centralus", rules: [] });
+      const pgTransport = wrapFakeArm(fakePg, async (req, next) => {
+        if (req.method === "PUT") {
+          return {
+            status: 202,
+            headers: {
+              "azure-asyncoperation": `https://management.azure.com/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.DBforPostgreSQL/locations/centralus/operationResults/op-bad-202`,
+              "x-ms-request-id": "req-bad-202-pg",
+            },
+            body: testCase.body,
+          };
+        }
+        return next();
+      });
+      const pgAudit = new MemoryAuditSink();
+      const pgWriter = createAzurePostgresFirewallWriter({
+        transport: pgTransport,
+        tokenProvider: { async getToken() { return TOKEN; } },
+        audit: pgAudit,
+        now: () => NOW,
+        sleep: async () => undefined,
+      });
+      const pgOutcome = await pgWriter.addRule(addRequest(PG_ID));
+      assert.equal(pgOutcome.ok, false, `child-writer ${testCase.label}`);
+      if (!pgOutcome.ok) {
+        assert.equal(pgOutcome.error.code, "cloud_response_invalid", `child-writer ${testCase.label}`);
+        assert.equal(pgOutcome.error.cloudStatus, 202, `child-writer ${testCase.label}`);
+        assert.equal(pgOutcome.error.ruleApplied, true, `child-writer ${testCase.label} must preserve ruleApplied=true`);
+        assert.equal(pgOutcome.error.removalVerified, false, `child-writer ${testCase.label} must keep removalVerified=false`);
+      }
+    }
+  });
+
+  it("#10 enforces strict poll deadline without overdue GETs, passes remaining budget timeoutMs, and stops retries past deadline", async () => {
+    // Subcase A: Sleep reaches deadline -> no GET is sent once budget hits 0, and each poll receives bounded timeoutMs.
+    const opUrl = `https://management.azure.com/subscriptions/00000000-0000-0000-0000-000000000000/providers/Microsoft.Sql/locations/centralus/operationResults/op-deadline`;
+    let clockMs = NOW.getTime();
+    const pollTimeouts: Array<number | undefined> = [];
+    const pollElapsedAtSend: number[] = [];
+    const transport: HttpTransport = {
+      async send(req: HttpRequest): Promise<HttpResponse> {
+        if (req.method === "PUT") {
+          return {
+            status: 202,
+            headers: { "azure-asyncoperation": opUrl, "retry-after": "30" },
+            body: JSON.stringify({ status: "InProgress" }),
+          };
+        }
+        pollTimeouts.push(req.timeoutMs);
+        pollElapsedAtSend.push(clockMs - NOW.getTime());
+        return {
+          status: 200,
+          headers: { "retry-after": "30" },
+          body: JSON.stringify({ status: "InProgress" }),
+        };
+      },
+    };
+    const arm = new ArmClient({
+      transport,
+      tokenProvider: { async getToken() { return TOKEN; } },
+      userAgent: "test-agent",
+      now: () => new Date(clockMs),
+      sleep: async (ms) => {
+        clockMs += ms;
+      },
+    });
+    const res = await arm.put(`${SQL_ID}/firewallRules/${SBC_RULE}`, AZURE_SQL_FIREWALL_PROFILE.apiVersion, {
+      properties: { startIpAddress: PUBLIC_IP, endIpAddress: PUBLIC_IP },
+    });
+    assert.equal(res.ok, false);
+    if (!res.ok) {
+      assert.equal(res.error.code, "lro_timeout");
+      assert.equal(res.error.ruleApplied, true);
+      assert.equal(res.error.removalVerified, false);
+    }
+    assert.ok(pollElapsedAtSend.length > 0);
+    for (let i = 0; i < pollElapsedAtSend.length; i += 1) {
+      const elapsed = pollElapsedAtSend[i] ?? MAX_LRO_BUDGET_MS;
+      const timeout = pollTimeouts[i];
+      assert.ok(elapsed < MAX_LRO_BUDGET_MS, `poll ${i} sent at ${elapsed}ms (must be < ${MAX_LRO_BUDGET_MS}ms)`);
+      assert.ok(
+        timeout !== undefined && timeout > 0 && elapsed + timeout <= MAX_LRO_BUDGET_MS,
+        `poll ${i} timeoutMs=${timeout} at elapsed=${elapsed} exceeds deadline ${MAX_LRO_BUDGET_MS}`,
+      );
+    }
+
+    // Subcase B: Transport failure that consumes remaining budget does not trigger additional GET retries past the deadline.
+    let retryClockMs = NOW.getTime();
+    let getAttempts = 0;
+    const retryTransport: HttpTransport = {
+      async send(req: HttpRequest): Promise<HttpResponse> {
+        if (req.method === "PUT") {
+          return {
+            status: 202,
+            headers: { "azure-asyncoperation": opUrl, "retry-after": "10" },
+            body: JSON.stringify({ status: "InProgress" }),
+          };
+        }
+        getAttempts += 1;
+        // Simulate transport hanging until past MAX_LRO_BUDGET_MS.
+        retryClockMs = NOW.getTime() + MAX_LRO_BUDGET_MS + 1;
+        throw new Error("socket timed out");
+      },
+    };
+    const armRetry = new ArmClient({
+      transport: retryTransport,
+      tokenProvider: { async getToken() { return TOKEN; } },
+      userAgent: "test-agent",
+      now: () => new Date(retryClockMs),
+      sleep: async (ms) => {
+        retryClockMs += ms;
+      },
+    });
+    const retryRes = await armRetry.put(`${SQL_ID}/firewallRules/${SBC_RULE}`, AZURE_SQL_FIREWALL_PROFILE.apiVersion, {
+      properties: { startIpAddress: PUBLIC_IP, endIpAddress: PUBLIC_IP },
+    });
+    assert.equal(retryRes.ok, false);
+    assert.equal(getAttempts, 1, "must not retry poll GET after budget is exhausted");
+    if (!retryRes.ok) {
+      assert.equal(retryRes.error.ruleApplied, true);
+      assert.equal(retryRes.error.removalVerified, false);
+    }
+
+    // Subcase C: createFetchTransport honors request.timeoutMs when smaller than default timeout.
+    let seenSignal: AbortSignal | undefined;
+    const fetchTransport = createFetchTransport(
+      async (_input, init) => {
+        seenSignal = init.signal ?? undefined;
+        return new Response("{}", { status: 200 });
+      },
+      30_000,
+    );
+    const fetchResp = await fetchTransport.send({
+      method: "GET",
+      url: opUrl,
+      headers: {},
+      timeoutMs: 2_500,
+    });
+    assert.equal(fetchResp.status, 200);
+    assert.ok(seenSignal !== undefined, "createFetchTransport must pass AbortSignal");
+  });
+
+  it("#8 surfaces rollback audit failures (audit_intent_failed and audit_completion_failed) without skipping cleanup", async () => {
+    for (const failPhase of ["intent", "result"] as const) {
+      const fake = new FakeArm();
+      fake.seedServer({
+        resourceId: SQL_ID,
+        location: "centralus",
+        rules: [{ name: "AllowAllWindowsAzureIps", startIpv4: "0.0.0.0", endIpv4: "0.0.0.0" }],
+      });
+      let deleteSent = false;
+      const transport = wrapFakeArm(fake, async (req, next) => {
+        if (req.method === "DELETE") {
+          deleteSent = true;
+        }
+        return next();
+      });
+      const audit: AuditSink = {
+        async emit(event: AuditEvent) {
+          if (event.operation === "remove" && event.phase === failPhase) {
+            throw new Error("audit sink unavailable");
+          }
+        },
+      };
+      const provider = createAzureSqlRuleProvider({
+        transport,
+        tokenProvider: { async getToken() { return TOKEN; } },
+        audit,
+        now: () => NOW,
+        sleep: async () => undefined,
+      });
+      const outcome = await provider.openRule({
+        ledgerOwned: true,
+        resourceId: SQL_ID,
+        ruleName: SBC_RULE,
+        ipv4: PUBLIC_IP,
+        ttlSeconds: 600,
+      });
+      assert.equal(deleteSent, true, `cleanup DELETE must not be skipped when rollback ${failPhase} audit fails`);
+      assert.equal(outcome.ok, false);
+      if (!outcome.ok) {
+        assert.equal(
+          outcome.error.code,
+          failPhase === "intent" ? "audit_intent_failed" : "audit_completion_failed",
+          `rollback ${failPhase} audit failure must be surfaced`,
+        );
+        assert.equal(outcome.error.ruleApplied, false, "verified rollback removal must preserve ruleApplied=false");
+        assert.equal(outcome.error.removalVerified, true, "verified rollback removal must preserve removalVerified=true");
+      }
+    }
   });
 });

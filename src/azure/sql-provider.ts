@@ -312,7 +312,7 @@ export class AzureSqlFirewallRuleProvider implements AzureSqlRuleProvider {
       properties: { startIpAddress: wantedIp, endIpAddress: wantedIp },
     });
     if (!put.ok) {
-      if (put.error.ruleApplied) {
+      if (put.error.ruleApplied || put.error.cloudStatus === 202) {
         return this.failed("add", events, withState(put.error, true, false), fields, true, put.requestId);
       }
       if (put.error.code === "throttled") {
@@ -337,7 +337,7 @@ export class AzureSqlFirewallRuleProvider implements AzureSqlRuleProvider {
     const listed = await this.readAllRules(parsedParent.value);
     if (!listed.ok) {
       const rollback = await this.rollbackOwnRule(events, parsedParent.value, ruleName);
-      return this.failed(
+      const outcome = await this.failed(
         "add",
         events,
         writerError({
@@ -354,12 +354,13 @@ export class AzureSqlFirewallRuleProvider implements AzureSqlRuleProvider {
         listed.requestId,
         "verify_failed",
       );
+      return this.applyRollbackAuditFailure(outcome, rollback);
     }
 
     const violation = inspectServerRules(listed.rules, ruleName, parsedName.value.ulid, wantedIp);
     if (violation !== null) {
       const rollback = await this.rollbackOwnRule(events, parsedParent.value, ruleName);
-      return this.failed(
+      const outcome = await this.failed(
         "add",
         events,
         writerError({
@@ -373,6 +374,7 @@ export class AzureSqlFirewallRuleProvider implements AzureSqlRuleProvider {
         listed.requestId,
         violation.detailCode,
       );
+      return this.applyRollbackAuditFailure(outcome, rollback);
     }
 
     const value: SqlOpenRuleValue = {
@@ -499,22 +501,47 @@ export class AzureSqlFirewallRuleProvider implements AzureSqlRuleProvider {
     );
   }
 
+  private applyRollbackAuditFailure(
+    outcome: SqlRuleOutcome<never>,
+    rollback: { verifiedAbsent: boolean; auditFailure: "audit_intent_failed" | "audit_completion_failed" | null },
+  ): SqlRuleOutcome<never> {
+    if (rollback.auditFailure === null) {
+      return outcome;
+    }
+    if (!outcome.ok && outcome.error.code === "audit_completion_failed" && rollback.auditFailure === "audit_completion_failed") {
+      return outcome;
+    }
+    return {
+      ok: false,
+      audit: outcome.audit,
+      error: writerError({
+        code: rollback.auditFailure,
+        message:
+          rollback.auditFailure === "audit_intent_failed"
+            ? "The audit sink did not accept the rollback intent event. Cleanup was not skipped."
+            : "The audit sink did not accept the rollback completion event.",
+        ruleApplied: !rollback.verifiedAbsent,
+        removalVerified: rollback.verifiedAbsent,
+      }),
+    };
+  }
+
   private async rollbackOwnRule(
     events: AuditEvent[],
     parent: ParsedParent,
     ruleName: string,
-  ): Promise<{ verifiedAbsent: boolean }> {
+  ): Promise<{ verifiedAbsent: boolean; auditFailure: "audit_intent_failed" | "audit_completion_failed" | null }> {
     const rollbackFields: AuditFields = {
       resourceId: parent.canonicalId,
       ruleName,
       ipv4: null,
       ttlSeconds: null,
     };
-    await this.record(events, "remove", "intent", "succeeded", "ok", rollbackFields, true, null);
+    const intentOk = await this.record(events, "remove", "intent", "succeeded", "ok", rollbackFields, true, null);
     const path = childPath(AZURE_SQL_FIREWALL_PROFILE, parent, ruleName);
     const deleted = await this.arm.delete(path, AZURE_SQL_FIREWALL_PROFILE.apiVersion);
     if (!deleted.ok && deleted.error.code !== "not_found") {
-      await this.record(
+      const resultOk = await this.record(
         events,
         "remove",
         "result",
@@ -525,10 +552,11 @@ export class AzureSqlFirewallRuleProvider implements AzureSqlRuleProvider {
         deleted.error.cloudCode,
         deleted.requestId,
       );
-      return { verifiedAbsent: false };
+      const auditFailure = !intentOk ? "audit_intent_failed" : !resultOk ? "audit_completion_failed" : null;
+      return { verifiedAbsent: false, auditFailure };
     }
     const verified = await this.verifyRuleAbsent(path);
-    await this.record(
+    const resultOk = await this.record(
       events,
       "remove",
       "result",
@@ -539,7 +567,8 @@ export class AzureSqlFirewallRuleProvider implements AzureSqlRuleProvider {
       verified.ok ? null : verified.error.cloudCode,
       verified.requestId,
     );
-    return { verifiedAbsent: verified.ok };
+    const auditFailure = !intentOk ? "audit_intent_failed" : !resultOk ? "audit_completion_failed" : null;
+    return { verifiedAbsent: verified.ok, auditFailure };
   }
 
   private async verifyRuleAbsent(
