@@ -6,6 +6,7 @@ export interface HttpRequest {
   url: string;
   headers: Record<string, string>;
   body?: string;
+  timeoutMs?: number;
 }
 
 export interface HttpResponse {
@@ -20,7 +21,7 @@ export interface HttpTransport {
 
 export interface ArmTokenProvider {
   /** Returns the bearer token only. Do not include the "Bearer " prefix. */
-  getToken(): Promise<string>;
+  getToken(options?: { forceRefresh?: boolean }): Promise<string>;
 }
 
 export interface FetchLike {
@@ -46,12 +47,16 @@ export const DEFAULT_HTTP_TIMEOUT_MS = 30_000;
 export function createFetchTransport(fetchImpl: FetchLike = globalThis.fetch, timeoutMs = DEFAULT_HTTP_TIMEOUT_MS): HttpTransport {
   return {
     async send(request: HttpRequest): Promise<HttpResponse> {
+      const effectiveTimeoutMs =
+        request.timeoutMs !== undefined && Number.isFinite(request.timeoutMs) && request.timeoutMs > 0
+          ? Math.min(timeoutMs, request.timeoutMs)
+          : timeoutMs;
       const response = await fetchImpl(request.url, {
         method: request.method,
         headers: request.headers,
         body: request.body,
         redirect: "manual",
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: AbortSignal.timeout(effectiveTimeoutMs),
       });
       const headers: Record<string, string> = {};
       response.headers.forEach((value, key) => {
@@ -78,10 +83,10 @@ export function sameOriginArmUrl(candidate: string, endpoint: string): URL | nul
   if (target.username !== "" || target.password !== "") {
     return null;
   }
-  if (target.protocol !== "https:" && target.protocol !== "http:") {
+  if (base.protocol !== "https:" || target.protocol !== "https:") {
     return null;
   }
-  if (target.protocol !== base.protocol || target.host !== base.host) {
+  if (target.host !== base.host) {
     return null;
   }
   if (!target.pathname.startsWith("/subscriptions/")) {

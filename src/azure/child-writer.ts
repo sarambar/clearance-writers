@@ -20,8 +20,9 @@ import type {
   WriterDescriptor,
   WriterOutcome,
 } from "../writer.js";
-import { ArmClient, type ArmCall } from "./arm.js";
+import { ArmClient, isDefinitePutRejection, type ArmCall } from "./arm.js";
 import type { ArmTokenProvider, HttpTransport } from "./http.js";
+import { DELETE_VERIFY_BASE_DELAY_MS, DELETE_VERIFY_MAX_ATTEMPTS } from "./sql-provider.js";
 import {
   AZURE_POSTGRES_FIREWALL_PROFILE,
   AZURE_SQL_FIREWALL_PROFILE,
@@ -42,7 +43,10 @@ export interface AzureWriterOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Pinned commit SHA for audit provenance without mutating process.env. */
   writersCommitSha?: string;
-  /** Set false when caller persists Retry-After externally without inline sleeping. */
+  /**
+   * Controls inline 429/503 retries for GET and DELETE within the operation budget.
+   * PUT is never retried inline on 429/503.
+   */
   inlineThrottleRetry?: boolean;
 }
 
@@ -60,6 +64,7 @@ export class AzureChildFirewallWriter implements FirewallWriter {
   private readonly arm: ArmClient;
   private readonly auditSink: AuditSink;
   private readonly now: () => Date;
+  private readonly sleep: (ms: number) => Promise<void>;
   private readonly commitSha: string | undefined;
 
   constructor(profile: AzureChildFirewallProfile, options: AzureWriterOptions) {
@@ -67,13 +72,14 @@ export class AzureChildFirewallWriter implements FirewallWriter {
     this.descriptor = { id: profile.id, cloud: "azure", listShape: "child-resource" };
     this.auditSink = options.audit;
     this.now = options.now ?? (() => new Date());
+    this.sleep = options.sleep ?? defaultSleep;
     this.commitSha = options.writersCommitSha;
     this.arm = new ArmClient({
       transport: options.transport,
       tokenProvider: options.tokenProvider,
       endpoint: options.endpoint,
       now: this.now,
-      sleep: options.sleep,
+      sleep: this.sleep,
       inlineThrottleRetry: options.inlineThrottleRetry,
       userAgent: `clearance-writers/${WRITERS_VERSION} (${profile.id})`,
     });
@@ -206,11 +212,10 @@ export class AzureChildFirewallWriter implements FirewallWriter {
       properties: { startIpAddress: wantedStart, endIpAddress: wantedEnd },
     });
     if (!put.ok) {
+      if (!isDefinitePutRejection(put.error)) {
+        return this.failed("add", events, withApplied(put.error, true, false), fields, true, put.requestId);
+      }
       if (put.error.code === "throttled") {
-        // A 503 on PUT may still apply in ARM; treat it as possibly applied so the caller sweeps it.
-        if (put.error.cloudStatus === 503) {
-          return this.failed("add", events, withApplied(put.error, true, false), fields, true, put.requestId);
-        }
         const presence = await this.rulePresence(parsed.value, validated.value.ruleName, wantedStart, wantedEnd);
         if (presence === "absent") {
           return this.failed("add", events, withApplied(put.error, false, true), fields, false, put.requestId);
@@ -219,7 +224,7 @@ export class AzureChildFirewallWriter implements FirewallWriter {
       }
       const presence = await this.rulePresence(parsed.value, validated.value.ruleName, wantedStart, wantedEnd);
       const applied = presence !== "absent";
-      return this.failed("add", events, withApplied(put.error, applied), fields, applied, put.requestId);
+      return this.failed("add", events, withApplied(put.error, applied, false), fields, applied, put.requestId);
     }
     const verified = await this.readNamedRule(parsed.value, validated.value.ruleName);
     if (!verified.ok) {
@@ -313,34 +318,25 @@ export class AzureChildFirewallWriter implements FirewallWriter {
         childPath(this.profile, parsed.value, validated.value.ruleName),
         this.profile.apiVersion,
       );
-      if (!deleted.ok && deleted.error.code !== "not_found") {
-        const presence = await this.rulePresence(parsed.value, validated.value.ruleName);
-        if (presence === "absent") {
+      if (!deleted.ok) {
+        const deleteAccepted = deleted.error.ruleApplied || deleted.error.cloudStatus === 202;
+        if (deleted.error.code === "not_found" && !deleteAccepted) {
           alreadyAbsent = true;
         } else {
-          return this.failed("remove", events, withApplied(deleted.error, true), fields, true, deleted.requestId);
+          const presence = await this.rulePresence(parsed.value, validated.value.ruleName);
+          if (presence === "absent") {
+            alreadyAbsent = !deleteAccepted;
+          } else {
+            return this.failed("remove", events, withApplied(deleted.error, true), fields, true, deleted.requestId);
+          }
         }
       } else {
-        alreadyAbsent = deleted.ok === false;
+        alreadyAbsent = false;
       }
     }
-    const after = await this.readNamedRule(parsed.value, validated.value.ruleName);
-    if (after.ok) {
-      return this.failed(
-        "remove",
-        events,
-        writerError({
-          code: "delete_not_verified",
-          message: "The firewall rule was still present after delete.",
-          ruleApplied: true,
-        }),
-        fields,
-        true,
-        after.requestId,
-      );
-    }
-    if (after.error.code !== "not_found") {
-      return this.failed("remove", events, withApplied(after.error, true), fields, true, after.requestId);
+    const verified = await this.verifyRuleAbsent(parsed.value, validated.value.ruleName);
+    if (!verified.ok) {
+      return this.failed("remove", events, withApplied(verified.error, true, false), fields, true, verified.requestId);
     }
     const value: RemoveRuleValue = {
       resourceId: parsed.value.canonicalId,
@@ -348,7 +344,7 @@ export class AzureChildFirewallWriter implements FirewallWriter {
       alreadyAbsent,
       removalVerified: true,
     };
-    const outcome = await this.succeeded("remove", events, fields, false, false, value, after.requestId);
+    const outcome = await this.succeeded("remove", events, fields, false, false, value, verified.requestId);
     if (!intentOk && outcome.ok) {
       return this.markAuditGap(outcome, "audit_intent_failed");
     }
@@ -450,6 +446,36 @@ export class AzureChildFirewallWriter implements FirewallWriter {
     return {
       ok: false,
       error: writerError({ code: "cloud_response_invalid", message: "The firewall rule list exceeded the page limit." }),
+    };
+  }
+
+  private async verifyRuleAbsent(
+    parent: ParsedParent,
+    ruleName: string,
+  ): Promise<{ ok: true; requestId: string | null } | { ok: false; error: WriterError; requestId: string | null }> {
+    let lastRequestId: string | null = null;
+    for (let attempt = 0; attempt < DELETE_VERIFY_MAX_ATTEMPTS; attempt += 1) {
+      const after = await this.readNamedRule(parent, ruleName);
+      lastRequestId = after.requestId;
+      if (!after.ok) {
+        if (after.error.code === "not_found") {
+          return { ok: true, requestId: after.requestId };
+        }
+        return { ok: false, error: after.error, requestId: after.requestId };
+      }
+      if (attempt + 1 < DELETE_VERIFY_MAX_ATTEMPTS) {
+        await this.sleep(DELETE_VERIFY_BASE_DELAY_MS * (1 << attempt));
+      }
+    }
+    return {
+      ok: false,
+      requestId: lastRequestId,
+      error: writerError({
+        code: "delete_not_verified",
+        message: "The firewall rule was still present after delete.",
+        ruleApplied: true,
+        removalVerified: false,
+      }),
     };
   }
 
@@ -699,4 +725,10 @@ export function createAzureSqlFirewallWriter(options: AzureWriterOptions): Firew
 
 export function createAzurePostgresFirewallWriter(options: AzureWriterOptions): FirewallWriter {
   return new AzureChildFirewallWriter(AZURE_POSTGRES_FIREWALL_PROFILE, options);
+}
+
+function defaultSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }

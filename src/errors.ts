@@ -28,6 +28,7 @@ export const WRITER_ERROR_CODES = [
   "ledger_required",
   "rule_conflict",
   "rule_cap_exceeded",
+  "rule_limit_reached",
   "last_rule_refused",
   "public_access_disabled",
   "location_mismatch",

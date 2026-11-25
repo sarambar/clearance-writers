@@ -49,7 +49,7 @@ ARM API version `2026-08-01-preview`, the default of `azure-mgmt-sql` 5.0.0b2, w
 
 CLI flags this REST call corresponds to: `--resource-group`/`-g`, `--server`/`-s`, `--name`/`-n`, `--start-ip-address`, `--end-ip-address`. The server flag is not `--server-name` and not `-n`.
 
-Server-level cap used by the adapter: 256 rules, counted before create. At the cap, a new name is refused and no PUT is sent. Delete is not refused because of the cap. Official docs describe up to a five-minute firewall cache after a change. Control-plane absence is not "closed at".
+Server-level cap used by the adapter: 256 rules, counted before create (`rule_cap_exceeded`). If ARM rejects a create with HTTP 400 and code `TooManyFirewallRules` (or the documented "firewall rules are over the limit" message), the error is mapped to `rule_limit_reached`. HTTP 429, 503, and other 5xx responses stay `throttled` or transport failures and are treated as maybe-applied. Delete is not refused because of the cap. Official docs describe up to a five-minute firewall cache after a change. Control-plane absence is not "closed at".
 
 ### PostgreSQL Flexible Server
 
@@ -108,7 +108,8 @@ What this package enforces:
 - Least privilege is the role above. It cannot stop a broader role someone assigns anyway.
 - It will not delete a rule whose name fails the Clearance allowlist.
 - It will not send `0.0.0.0` or a broad range under the default policy.
-- It will not follow an ARM `nextLink`, `Location`, or `Azure-AsyncOperation` URL onto another host, and the HTTP transport does not follow redirects.
+- It will not follow an ARM `nextLink`, `Location`, or `Azure-AsyncOperation` URL onto another host or over non-HTTPS, and the HTTP transport does not follow redirects.
+- `PUT` requests are never retried inline on HTTP `429`/`503` (even when `inlineThrottleRetry` is omitted or `true`) so a delayed retry cannot recreate a rule after cleanup. `GET` and `DELETE` may retry inline within the operation budget when `inlineThrottleRetry` is enabled.
 - It classifies `AuthorizationFailed` and `LinkedAuthorizationFailed` as authorization denials. `BadGateway`, including the message about insufficient information to enforce access control policy, is not a denial. An empty list is an empty list, not a denial.
 - It does not open a database connection and does not hold a data-plane credential.
 
