@@ -7,6 +7,7 @@ import { headerValue, sameOriginArmUrl, type ArmTokenProvider, type HttpTranspor
 
 /** azure-core's default polling interval when Retry-After is absent. */
 export const LRO_DEFAULT_DELAY_MS = 30_000;
+export const LRO_MIN_DELAY_MS = 1_000;
 export const LRO_MAX_DELAY_MS = 30_000;
 export const THROTTLE_DEFAULT_DELAY_MS = 1_000;
 export const MAX_HTTP_ATTEMPTS = 3;
@@ -16,6 +17,19 @@ export const MAX_RESPONSE_CHARS = 1_000_000;
 
 const REDIRECT = new Set([301, 302, 303, 307, 308]);
 const ARM_AUTHORIZATION_DENIAL = new Set(["AuthorizationFailed", "LinkedAuthorizationFailed"]);
+const ARM_RULE_LIMIT_CODES = new Set([
+  "toomanyfirewallrules",
+  "firewallrulelimitexceeded",
+  "maxfirewallruleslimitexceeded",
+  "serverfirewallrulelimitexceeded",
+  "maxnumberoffirewallrulesexceeded",
+  "firewallrulequotaexceeded",
+]);
+
+interface OperationBudget {
+  startedAtMs: number;
+  sleptMs: number;
+}
 
 export interface ArmSuccess {
   ok: true;
@@ -39,7 +53,10 @@ export interface ArmClientOptions {
   endpoint?: string;
   now?: () => Date;
   sleep?: (ms: number) => Promise<void>;
-  /** Set false when the caller coordinates Retry-After externally without inline sleeping. */
+  /**
+   * Controls inline 429/503 retries for GET and DELETE within the operation budget.
+   * PUT is never retried inline on 429/503 so a delayed retry cannot recreate a rule after cleanup.
+   */
   inlineThrottleRetry?: boolean;
   userAgent: string;
 }
@@ -64,7 +81,7 @@ export class ArmClient {
   }
 
   async get(path: string, apiVersion: string): Promise<ArmCall> {
-    return this.request("GET", this.resourceUrl(path, apiVersion), undefined, [200]);
+    return this.request("GET", this.resourceUrl(path, apiVersion), undefined, [200], this.startBudget(), false);
   }
 
   async getAbsolute(url: string): Promise<ArmCall> {
@@ -74,27 +91,57 @@ export class ArmClient {
         requestId: null,
         error: writerError({
           code: "unsafe_poll_url",
-          message: "Refusing to follow a URL that is not on the ARM endpoint.",
+          message: "Refusing to follow a URL that is not an HTTPS URL on the ARM endpoint.",
         }),
       };
     }
-    return this.request("GET", url, undefined, [200]);
+    return this.request("GET", url, undefined, [200], this.startBudget(), false);
   }
 
   async put(path: string, apiVersion: string, body: unknown): Promise<ArmCall> {
-    const initial = await this.request("PUT", this.resourceUrl(path, apiVersion), JSON.stringify(body), [200, 201, 202]);
+    const budget = this.startBudget();
+    const initial = await this.request(
+      "PUT",
+      this.resourceUrl(path, apiVersion),
+      JSON.stringify(body),
+      [200, 201, 202],
+      budget,
+      false,
+    );
     if (!initial.ok || initial.status !== 202) {
       return initial;
     }
-    return this.poll(initial, path, apiVersion);
+    return this.poll(initial, budget);
   }
 
   async delete(path: string, apiVersion: string): Promise<ArmCall> {
-    const initial = await this.request("DELETE", this.resourceUrl(path, apiVersion), undefined, [200, 202, 204]);
+    const budget = this.startBudget();
+    const initial = await this.request(
+      "DELETE",
+      this.resourceUrl(path, apiVersion),
+      undefined,
+      [200, 202, 204],
+      budget,
+      false,
+    );
     if (!initial.ok || initial.status !== 202) {
       return initial;
     }
-    return this.poll(initial, path, apiVersion);
+    return this.poll(initial, budget);
+  }
+
+  private startBudget(): OperationBudget {
+    return { startedAtMs: this.now().getTime(), sleptMs: 0 };
+  }
+
+  private effectiveNowMs(budget: OperationBudget): number {
+    return Math.max(this.now().getTime(), budget.startedAtMs + budget.sleptMs);
+  }
+
+  private remainingBudgetMs(budget: OperationBudget): number {
+    const wallElapsed = Math.max(0, this.now().getTime() - budget.startedAtMs);
+    const elapsed = Math.max(budget.sleptMs, wallElapsed);
+    return Math.max(0, MAX_LRO_BUDGET_MS - elapsed);
   }
 
   private resourceUrl(path: string, apiVersion: string): string {
@@ -104,7 +151,7 @@ export class ArmClient {
     return url.toString();
   }
 
-  private async poll(initial: ArmSuccess, _path: string, _apiVersion: string): Promise<ArmCall> {
+  private async poll(initial: ArmSuccess, budget: OperationBudget): Promise<ArmCall> {
     const pollTarget = operationUrl(initial.headers, this.endpoint);
     if (pollTarget.kind !== "url") {
       return {
@@ -114,40 +161,45 @@ export class ArmClient {
           code: pollTarget.kind === "unsafe" ? "unsafe_poll_url" : "lro_malformed",
           message:
             pollTarget.kind === "unsafe"
-              ? "Refusing to poll an operation URL that is not on the ARM endpoint."
-              : "ARM returned 202 without a same-origin Azure-AsyncOperation or Location URL.",
+              ? "Refusing to poll an operation URL that is not an HTTPS URL on the ARM endpoint."
+              : "ARM returned 202 without an HTTPS Azure-AsyncOperation or Location URL on the ARM endpoint.",
           cloudStatus: 202,
-          ruleApplied: false,
+          ruleApplied: true,
+          removalVerified: false,
         }),
       };
     }
     const pollUrl = pollTarget.url;
     const source = pollTarget.source;
-    let budget = 0;
-    let delay = retryAfterMs(initial.headers, this.now().getTime()) ?? LRO_DEFAULT_DELAY_MS;
+    let delay = pollDelayMs(initial.headers, this.effectiveNowMs(budget));
     const successStatuses = source === "location" ? [200, 201, 202, 204] : [200, 202];
     for (let poll = 0; poll < MAX_LRO_POLLS; poll += 1) {
-      const remaining = MAX_LRO_BUDGET_MS - budget;
+      const remaining = this.remainingBudgetMs(budget);
       if (remaining <= 0) {
         break;
       }
-      const wait = Math.min(delay, remaining);
-      budget += wait;
+      const wait = Math.min(delay, LRO_MAX_DELAY_MS, remaining);
+      budget.sleptMs += wait;
       await this.sleep(wait);
-      const status = await this.request("GET", pollUrl, undefined, successStatuses);
+      const status = await this.request("GET", pollUrl, undefined, successStatuses, budget, true);
       if (!status.ok) {
-        return status;
+        return {
+          ok: false,
+          requestId: status.requestId ?? initial.requestId,
+          error: indeterminateAfterAccepted(status.error),
+        };
       }
       const state = lroState(status.body);
-      delay = retryAfterMs(status.headers, this.now().getTime()) ?? LRO_DEFAULT_DELAY_MS;
+      delay = pollDelayMs(status.headers, this.effectiveNowMs(budget));
       if (state === "failed") {
         const cloud = readError(status.body);
-        const closed = publicAccessDisabledError(status.status, cloud);
+        const specific =
+          publicAccessDisabledError(status.status, cloud) ?? ruleLimitReachedError(status.status, cloud, null);
         return {
           ok: false,
           requestId: status.requestId,
           error:
-            closed ??
+            specific ??
             writerError({
               code: "lro_failed",
               message: escapeForOutput(cloud?.message ?? "The long-running operation failed."),
@@ -167,15 +219,23 @@ export class ArmClient {
           }),
         };
       }
+      if (state === "succeeded" && status.status !== 202) {
+        return status;
+      }
       if (state === "inprogress" || status.status === 202) {
         continue;
       }
-      if (source === "async" && state === "succeeded") {
-        return status;
-      }
-      if (source === "location" && (status.status === 200 || status.status === 201 || status.status === 204)) {
-        return status;
-      }
+      return {
+        ok: false,
+        requestId: status.requestId ?? initial.requestId,
+        error: writerError({
+          code: "lro_malformed",
+          message: "The long-running operation poll returned a non-202 response without a terminal operation status.",
+          cloudStatus: status.status,
+          ruleApplied: true,
+          removalVerified: false,
+        }),
+      };
     }
     return {
       ok: false,
@@ -185,6 +245,8 @@ export class ArmClient {
         message: "The long-running operation did not finish before the poll budget.",
         retryable: true,
         cloudStatus: 202,
+        ruleApplied: true,
+        removalVerified: false,
       }),
     };
   }
@@ -194,13 +256,18 @@ export class ArmClient {
     url: string,
     body: string | undefined,
     success: number[],
+    budget: OperationBudget,
+    allowAuthRefresh: boolean,
   ): Promise<ArmCall> {
-    const token = await this.bearer();
-    if (typeof token !== "string") {
-      return token;
-    }
     let last: ArmCall | null = null;
+    let authRefreshed = false;
+    let forcedToken: string | null = null;
     for (let attempt = 1; attempt <= MAX_HTTP_ATTEMPTS; attempt += 1) {
+      const token: string | ArmFailure = forcedToken ?? (await this.acquireToken(budget, false));
+      forcedToken = null;
+      if (typeof token !== "string") {
+        return token;
+      }
       let response;
       try {
         response = await this.transport.send({
@@ -253,13 +320,26 @@ export class ArmClient {
           }),
         };
       }
-      if (response.status === 429 || response.status === 503) {
-        const parsedMs = retryAfterMs(response.headers, this.now().getTime());
-        const delayMs = parsedMs ?? THROTTLE_DEFAULT_DELAY_MS;
-        const retryAfterSeconds = Math.max(1, Math.ceil(delayMs / 1000));
-        if (this.inlineThrottleRetry && attempt < MAX_HTTP_ATTEMPTS) {
-          await this.sleep(Math.min(delayMs, LRO_MAX_DELAY_MS));
+      if (response.status === 401 && allowAuthRefresh && !authRefreshed) {
+        authRefreshed = true;
+        const refreshed = await this.acquireToken(budget, true);
+        if (typeof refreshed === "string" && refreshed !== token) {
+          forcedToken = refreshed;
+          attempt -= 1;
           continue;
+        }
+      }
+      if (response.status === 429 || response.status === 503) {
+        const parsedMs = retryAfterMs(response.headers, this.effectiveNowMs(budget));
+        const delayMs = parsedMs === null || parsedMs <= 0 ? THROTTLE_DEFAULT_DELAY_MS : parsedMs;
+        const retryAfterSeconds = Math.max(1, Math.ceil(delayMs / 1000));
+        if (method !== "PUT" && this.inlineThrottleRetry && attempt < MAX_HTTP_ATTEMPTS) {
+          const retryWait = Math.min(Math.max(delayMs, THROTTLE_DEFAULT_DELAY_MS), LRO_MAX_DELAY_MS);
+          if (this.remainingBudgetMs(budget) >= retryWait) {
+            budget.sleptMs += retryWait;
+            await this.sleep(retryWait);
+            continue;
+          }
         }
         const parsed = parseBody(response.body);
         const cloud = readError(parsed.value);
@@ -306,10 +386,49 @@ export class ArmClient {
     );
   }
 
-  private async bearer(): Promise<string | ArmFailure> {
+  private async acquireToken(budget: OperationBudget, forceRefresh: boolean): Promise<string | ArmFailure> {
+    let token = await this.bearer(forceRefresh);
+    if (typeof token !== "string") {
+      return token;
+    }
+    const nowMs = this.effectiveNowMs(budget);
+    const expMs = jwtExpMs(token);
+    if (expMs !== null && expMs <= nowMs) {
+      if (forceRefresh) {
+        return {
+          ok: false,
+          requestId: null,
+          error: writerError({
+            code: "authentication_failed",
+            message: "ARM bearer token is expired and could not be refreshed.",
+          }),
+        };
+      }
+      token = await this.bearer(true);
+      if (typeof token !== "string") {
+        return token;
+      }
+      const refreshedExpMs = jwtExpMs(token);
+      if (refreshedExpMs !== null && refreshedExpMs <= this.effectiveNowMs(budget)) {
+        return {
+          ok: false,
+          requestId: null,
+          error: writerError({
+            code: "authentication_failed",
+            message: "ARM bearer token is expired and could not be refreshed.",
+          }),
+        };
+      }
+    }
+    return token;
+  }
+
+  private async bearer(forceRefresh: boolean): Promise<string | ArmFailure> {
     let token: string;
     try {
-      token = await this.tokenProvider.getToken();
+      token = forceRefresh
+        ? await this.tokenProvider.getToken({ forceRefresh: true })
+        : await this.tokenProvider.getToken();
     } catch {
       return {
         ok: false,
@@ -347,39 +466,37 @@ function operationUrl(
   endpoint: string,
 ): { kind: "url"; url: string; source: "async" | "location" } | { kind: "missing" } | { kind: "unsafe" } {
   const asyncOperation = headerValue(headers, "azure-asyncoperation");
+  if (asyncOperation !== undefined && asyncOperation.trim() !== "") {
+    const asyncUrl = resolvePollUrl(asyncOperation, endpoint);
+    return asyncUrl !== null ? { kind: "url", url: asyncUrl, source: "async" } : { kind: "unsafe" };
+  }
   const location = headerValue(headers, "location");
-  const asyncUrl = resolvePollUrl(asyncOperation, endpoint);
-  if (asyncUrl !== null) {
-    return { kind: "url", url: asyncUrl, source: "async" };
+  if (location !== undefined && location.trim() !== "") {
+    const locationUrl = resolvePollUrl(location, endpoint);
+    return locationUrl !== null ? { kind: "url", url: locationUrl, source: "location" } : { kind: "unsafe" };
   }
-  const locationUrl = resolvePollUrl(location, endpoint);
-  if (locationUrl !== null) {
-    return { kind: "url", url: locationUrl, source: "location" };
-  }
-  const present = [asyncOperation, location].some((value) => value !== undefined && value.trim() !== "");
-  return present ? { kind: "unsafe" } : { kind: "missing" };
+  return { kind: "missing" };
 }
 
-function resolvePollUrl(candidate: string | undefined, endpoint: string): string | null {
-  if (candidate === undefined || candidate.trim() === "") {
+function resolvePollUrl(candidate: string, endpoint: string): string | null {
+  const trimmed = candidate.trim();
+  if (trimmed === "") {
     return null;
   }
-  let target: URL;
-  try {
-    target = new URL(candidate, endpoint.endsWith("/") ? endpoint : `${endpoint}/`);
-  } catch {
-    return null;
-  }
-  if (sameOriginArmUrl(target.toString(), endpoint) === null) {
-    return null;
-  }
-  return target.toString();
+  const validated = sameOriginArmUrl(trimmed, endpoint);
+  return validated === null ? null : validated.toString();
 }
 
 function retryAfterMs(headers: Record<string, string>, nowMs = Date.now()): number | null {
   const milliseconds = headerValue(headers, "retry-after-ms") ?? headerValue(headers, "x-ms-retry-after-ms");
-  if (milliseconds !== undefined && /^[1-9][0-9]{0,8}$/.test(milliseconds.trim())) {
-    return Number(milliseconds.trim());
+  if (milliseconds !== undefined) {
+    const trimmedMs = milliseconds.trim();
+    if (/^[1-9][0-9]{0,8}$/.test(trimmedMs)) {
+      return Number(trimmedMs);
+    }
+    if (trimmedMs === "0") {
+      return 0;
+    }
   }
   const raw = headerValue(headers, "retry-after");
   if (raw === undefined) {
@@ -390,12 +507,55 @@ function retryAfterMs(headers: Record<string, string>, nowMs = Date.now()): numb
     return Number(trimmed) * 1000;
   }
   if (trimmed === "0") {
-    return null;
+    return 0;
   }
   const parsed = Date.parse(trimmed);
   if (!Number.isNaN(parsed)) {
     const delay = parsed - nowMs;
-    return delay > 0 ? delay : null;
+    return delay > 0 ? delay : 0;
+  }
+  return null;
+}
+
+function pollDelayMs(headers: Record<string, string>, nowMs: number): number {
+  const parsed = retryAfterMs(headers, nowMs);
+  if (parsed === null) {
+    return LRO_DEFAULT_DELAY_MS;
+  }
+  return Math.min(Math.max(parsed, LRO_MIN_DELAY_MS), LRO_MAX_DELAY_MS);
+}
+
+function indeterminateAfterAccepted(error: WriterError): WriterError {
+  return writerError({
+    code: error.code,
+    message: error.message,
+    retryable: error.retryable,
+    ruleApplied: true,
+    removalVerified: false,
+    authorizationDenial: error.authorizationDenial,
+    cloudCode: error.cloudCode,
+    cloudStatus: error.cloudStatus,
+    retryAfterSeconds: error.retryAfterSeconds,
+  });
+}
+
+function jwtExpMs(token: string): number | null {
+  const parts = token.split(".");
+  if (parts.length !== 3 || parts[1] === undefined || parts[1] === "") {
+    return null;
+  }
+  try {
+    const decoded = Buffer.from(parts[1], "base64url").toString("utf8");
+    const payload = JSON.parse(decoded) as unknown;
+    if (payload === null || typeof payload !== "object") {
+      return null;
+    }
+    const exp = (payload as Record<string, unknown>).exp;
+    if (typeof exp === "number" && Number.isFinite(exp)) {
+      return exp * 1000;
+    }
+  } catch {
+    return null;
   }
   return null;
 }
@@ -435,31 +595,31 @@ function readError(body: unknown): { code: string; message: string } | null {
   return null;
 }
 
-type LroKind = "inprogress" | "succeeded" | "failed" | "canceled" | "resource" | "unknown";
+type LroKind = "inprogress" | "succeeded" | "failed" | "canceled" | "unknown";
 
 function lroState(body: unknown): LroKind {
   if (body === null || typeof body !== "object") {
     return "unknown";
   }
   const record = body as Record<string, unknown>;
-  const status = typeof record.status === "string" ? record.status.toLowerCase() : null;
-  if (status === "succeeded") {
-    return "succeeded";
-  }
-  if (status === "failed") {
-    return "failed";
-  }
-  if (status === "canceled" || status === "cancelled") {
-    return "canceled";
-  }
-  if (status === "inprogress" || status === "running" || status === "accepted" || status === "creating" || status === "deleting") {
+  if (typeof record.status === "string") {
+    const status = record.status.trim().toLowerCase();
+    if (status === "succeeded") {
+      return "succeeded";
+    }
+    if (status === "failed") {
+      return "failed";
+    }
+    if (status === "canceled" || status === "cancelled") {
+      return "canceled";
+    }
     return "inprogress";
   }
   const properties = record.properties;
   if (properties !== null && typeof properties === "object") {
     const provisioning = (properties as Record<string, unknown>).provisioningState;
     if (typeof provisioning === "string") {
-      const value = provisioning.toLowerCase();
+      const value = provisioning.trim().toLowerCase();
       if (value === "succeeded") {
         return "succeeded";
       }
@@ -470,9 +630,6 @@ function lroState(body: unknown): LroKind {
         return "canceled";
       }
       return "inprogress";
-    }
-    if (typeof (properties as Record<string, unknown>).startIpAddress === "string") {
-      return "resource";
     }
   }
   return "unknown";
@@ -520,6 +677,43 @@ function publicAccessDisabled(code: string, message: string): boolean {
   );
 }
 
+function ruleLimitReachedError(
+  status: number,
+  cloud: { code: string; message: string } | null,
+  token: string | null,
+): WriterError | null {
+  if (cloud === null || !ruleLimitReached(cloud.code, cloud.message)) {
+    return null;
+  }
+  const cloudCode = cloud.code === "" ? null : safeCloudCode(cloud.code);
+  const message =
+    token === null
+      ? escapeForOutput(cloud.message || "The server has reached its firewall rule limit.")
+      : redact(cloud.message || "The server has reached its firewall rule limit.", token);
+  return writerError({
+    code: "rule_limit_reached",
+    message,
+    cloudCode,
+    cloudStatus: status,
+    authorizationDenial: false,
+    retryable: false,
+  });
+}
+
+function ruleLimitReached(code: string, message: string): boolean {
+  if (code !== "" && ARM_RULE_LIMIT_CODES.has(code.toLowerCase())) {
+    return true;
+  }
+  const text = message.toLowerCase();
+  return (
+    text.includes("firewall rules are over the limit") ||
+    text.includes("maximum number of firewall rules") ||
+    text.includes("too many firewall rules") ||
+    text.includes("firewall rule limit") ||
+    /\b256\b.*firewall rule|firewall rule.*\b256\b/.test(text)
+  );
+}
+
 function safeCloudCode(code: string | null): string | null {
   if (code === null) {
     return null;
@@ -536,6 +730,10 @@ function classifyFailure(
   const closed = publicAccessDisabledError(status, cloud);
   if (closed !== null) {
     return closed;
+  }
+  const limit = ruleLimitReachedError(status, cloud, token);
+  if (limit !== null) {
+    return limit;
   }
   const code = safeCloudCode(cloud?.code ?? null);
   const message = redact(cloud?.message ?? `ARM returned HTTP ${status}.`, token);

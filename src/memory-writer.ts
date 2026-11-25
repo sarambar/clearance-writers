@@ -84,18 +84,29 @@ export class InMemoryFirewallWriter implements FirewallWriter {
           true,
           writerError({ code: "rule_conflict", message: "An in-memory rule with this name already exists.", ruleApplied: true }),
           validated.value.resourceId,
+          [intent],
         );
       }
-      return this.finish("add", "succeeded", "ok", validated.value, true, true, {
-        resourceId: validated.value.resourceId,
-        ruleName: validated.value.ruleName,
-        startIpv4: validated.value.address.startIpv4,
-        endIpv4: validated.value.address.endIpv4,
-        replayed: true,
-        locationRaw: null,
-        locationNormalized: null,
-        ruleCountBefore: bucket.size,
-      });
+      return this.finish(
+        "add",
+        "succeeded",
+        "ok",
+        validated.value,
+        true,
+        true,
+        {
+          resourceId: validated.value.resourceId,
+          ruleName: validated.value.ruleName,
+          startIpv4: validated.value.address.startIpv4,
+          endIpv4: validated.value.address.endIpv4,
+          replayed: true,
+          locationRaw: null,
+          locationNormalized: null,
+          ruleCountBefore: bucket.size,
+        },
+        undefined,
+        [intent],
+      );
     }
     bucket.set(validated.value.ruleName, {
       ruleName: validated.value.ruleName,
@@ -104,16 +115,26 @@ export class InMemoryFirewallWriter implements FirewallWriter {
       owned: true,
       providerId: null,
     });
-    const created = await this.finish<AddRuleValue>("add", "succeeded", "ok", validated.value, false, true, {
-      resourceId: validated.value.resourceId,
-      ruleName: validated.value.ruleName,
-      startIpv4: validated.value.address.startIpv4,
-      endIpv4: validated.value.address.endIpv4,
-      replayed: false,
-      locationRaw: null,
-      locationNormalized: null,
-      ruleCountBefore: bucket.size - 1,
-    });
+    const created = await this.finish<AddRuleValue>(
+      "add",
+      "succeeded",
+      "ok",
+      validated.value,
+      false,
+      true,
+      {
+        resourceId: validated.value.resourceId,
+        ruleName: validated.value.ruleName,
+        startIpv4: validated.value.address.startIpv4,
+        endIpv4: validated.value.address.endIpv4,
+        replayed: false,
+        locationRaw: null,
+        locationNormalized: null,
+        ruleCountBefore: bucket.size - 1,
+      },
+      undefined,
+      [intent],
+    );
     if (!created.ok) {
       bucket.delete(validated.value.ruleName);
     }
@@ -136,7 +157,9 @@ export class InMemoryFirewallWriter implements FirewallWriter {
         writerError({ code: "invalid_resource_id", message: "In-memory resource ids use the memory: prefix." }),
       );
     }
-    const intentOk = (await this.emit("remove", "intent", "succeeded", "ok", validated.value, false, false)) !== null;
+    const intent = await this.emit("remove", "intent", "succeeded", "ok", validated.value, false, false);
+    const intentOk = intent !== null;
+    const prior = intent === null ? [] : [intent];
     const bucket = this.bucket(validated.value.resourceId);
     const existing = bucket.get(validated.value.ruleName);
     const alreadyAbsent = existing === undefined;
@@ -150,14 +173,26 @@ export class InMemoryFirewallWriter implements FirewallWriter {
         false,
         true,
         writerError({ code: "delete_not_verified", message: "The in-memory rule is still present.", ruleApplied: true }),
+        undefined,
+        prior,
       );
     }
-    const removed = await this.finish<RemoveRuleValue>("remove", "succeeded", "ok", validated.value, false, false, {
-      resourceId: validated.value.resourceId,
-      ruleName: validated.value.ruleName,
-      alreadyAbsent,
-      removalVerified: true,
-    });
+    const removed = await this.finish<RemoveRuleValue>(
+      "remove",
+      "succeeded",
+      "ok",
+      validated.value,
+      false,
+      false,
+      {
+        resourceId: validated.value.resourceId,
+        ruleName: validated.value.ruleName,
+        alreadyAbsent,
+        removalVerified: true,
+      },
+      undefined,
+      prior,
+    );
     if (!intentOk && removed.ok) {
       return {
         ok: false,
@@ -282,6 +317,7 @@ export class InMemoryFirewallWriter implements FirewallWriter {
     ruleApplied: boolean,
     valueOrError: NoInfer<T | WriterError>,
     canonicalId?: string,
+    priorEvents: readonly AuditEvent[] = [],
   ): Promise<WriterOutcome<T>> {
     const event = buildAuditEvent({
       phase: "result",
@@ -297,7 +333,7 @@ export class InMemoryFirewallWriter implements FirewallWriter {
       ruleApplied,
       occurredAt: this.now().toISOString(),
     });
-    const events: AuditEvent[] = [];
+    const events: AuditEvent[] = [...priorEvents];
     try {
       await this.auditSink.emit(event);
       events.push(event);

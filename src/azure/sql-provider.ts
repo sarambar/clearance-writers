@@ -26,6 +26,9 @@ export const AZURE_SQL_RULE_PROVIDER_ACTIONS = [
   "Microsoft.Sql/servers/firewallRules/delete",
 ] as const;
 
+export const DELETE_VERIFY_MAX_ATTEMPTS = 4;
+export const DELETE_VERIFY_BASE_DELAY_MS = 250;
+
 export interface AzureSqlRuleProviderOptions {
   transport: HttpTransport;
   tokenProvider: ArmTokenProvider;
@@ -223,18 +226,20 @@ export class AzureSqlFirewallRuleProvider implements AzureSqlRuleProvider {
   private readonly arm: ArmClient;
   private readonly auditSink: AuditSink;
   private readonly now: () => Date;
+  private readonly sleep: (ms: number) => Promise<void>;
   private readonly commitSha: string | undefined;
 
   constructor(options: AzureSqlRuleProviderOptions) {
     this.auditSink = options.audit;
     this.now = options.now ?? (() => new Date());
+    this.sleep = options.sleep ?? defaultSleep;
     this.commitSha = options.writersCommitSha;
     this.arm = new ArmClient({
       transport: options.transport,
       tokenProvider: options.tokenProvider,
       endpoint: options.endpoint,
       now: this.now,
-      sleep: options.sleep,
+      sleep: this.sleep,
       inlineThrottleRetry: false,
       userAgent: `clearance-writers/${WRITERS_VERSION} (${AZURE_SQL_FIREWALL_PROFILE.id})`,
     });
@@ -307,6 +312,9 @@ export class AzureSqlFirewallRuleProvider implements AzureSqlRuleProvider {
       properties: { startIpAddress: wantedIp, endIpAddress: wantedIp },
     });
     if (!put.ok) {
+      if (put.error.ruleApplied) {
+        return this.failed("add", events, withState(put.error, true, false), fields, true, put.requestId);
+      }
       if (put.error.code === "throttled") {
         // A 503 on PUT may still apply in ARM; treat it as possibly applied so the caller sweeps it.
         if (put.error.cloudStatus === 503) {
@@ -322,13 +330,13 @@ export class AzureSqlFirewallRuleProvider implements AzureSqlRuleProvider {
       }
       const presence = await this.rulePresence(parsedParent.value, ruleName);
       const applied = presence !== "absent";
-      return this.failed("add", events, withState(put.error, applied), fields, applied, put.requestId);
+      return this.failed("add", events, withState(put.error, applied, false), fields, applied, put.requestId);
     }
 
     // Open read-back: list server rules via firewallRules/read only (B-T5), never exposing customer rules (B-T6).
     const listed = await this.readAllRules(parsedParent.value);
     if (!listed.ok) {
-      const rollback = await this.rollbackOwnRule(parsedParent.value, ruleName);
+      const rollback = await this.rollbackOwnRule(events, parsedParent.value, ruleName);
       return this.failed(
         "add",
         events,
@@ -350,7 +358,7 @@ export class AzureSqlFirewallRuleProvider implements AzureSqlRuleProvider {
 
     const violation = inspectServerRules(listed.rules, ruleName, parsedName.value.ulid, wantedIp);
     if (violation !== null) {
-      const rollback = await this.rollbackOwnRule(parsedParent.value, ruleName);
+      const rollback = await this.rollbackOwnRule(events, parsedParent.value, ruleName);
       return this.failed(
         "add",
         events,
@@ -425,23 +433,9 @@ export class AzureSqlFirewallRuleProvider implements AzureSqlRuleProvider {
       }
     }
 
-    const after = await this.arm.get(path, AZURE_SQL_FIREWALL_PROFILE.apiVersion);
-    if (after.ok) {
-      return this.failed(
-        "remove",
-        events,
-        writerError({
-          code: "delete_not_verified",
-          message: "The firewall rule was still present after delete.",
-          ruleApplied: true,
-        }),
-        fields,
-        true,
-        after.requestId,
-      );
-    }
-    if (after.error.code !== "not_found") {
-      return this.failed("remove", events, withState(after.error, true), fields, true, after.requestId);
+    const verified = await this.verifyRuleAbsent(path);
+    if (!verified.ok) {
+      return this.failed("remove", events, withState(verified.error, true, false), fields, true, verified.requestId);
     }
 
     const value: SqlCloseRuleValue = {
@@ -450,7 +444,7 @@ export class AzureSqlFirewallRuleProvider implements AzureSqlRuleProvider {
       alreadyAbsent,
       removalVerified: true,
     };
-    const outcome = await this.succeeded("remove", events, fields, false, value, after.requestId);
+    const outcome = await this.succeeded("remove", events, fields, false, value, verified.requestId);
     if (!intentOk && outcome.ok) {
       return {
         ok: false,
@@ -505,14 +499,76 @@ export class AzureSqlFirewallRuleProvider implements AzureSqlRuleProvider {
     );
   }
 
-  private async rollbackOwnRule(parent: ParsedParent, ruleName: string): Promise<{ verifiedAbsent: boolean }> {
+  private async rollbackOwnRule(
+    events: AuditEvent[],
+    parent: ParsedParent,
+    ruleName: string,
+  ): Promise<{ verifiedAbsent: boolean }> {
+    const rollbackFields: AuditFields = {
+      resourceId: parent.canonicalId,
+      ruleName,
+      ipv4: null,
+      ttlSeconds: null,
+    };
+    await this.record(events, "remove", "intent", "succeeded", "ok", rollbackFields, true, null);
     const path = childPath(AZURE_SQL_FIREWALL_PROFILE, parent, ruleName);
     const deleted = await this.arm.delete(path, AZURE_SQL_FIREWALL_PROFILE.apiVersion);
     if (!deleted.ok && deleted.error.code !== "not_found") {
+      await this.record(
+        events,
+        "remove",
+        "result",
+        "failed",
+        deleted.error.code,
+        rollbackFields,
+        true,
+        deleted.error.cloudCode,
+        deleted.requestId,
+      );
       return { verifiedAbsent: false };
     }
-    const after = await this.arm.get(path, AZURE_SQL_FIREWALL_PROFILE.apiVersion);
-    return { verifiedAbsent: !after.ok && after.error.code === "not_found" };
+    const verified = await this.verifyRuleAbsent(path);
+    await this.record(
+      events,
+      "remove",
+      "result",
+      verified.ok ? "succeeded" : "failed",
+      verified.ok ? "ok" : verified.error.code,
+      rollbackFields,
+      !verified.ok,
+      verified.ok ? null : verified.error.cloudCode,
+      verified.requestId,
+    );
+    return { verifiedAbsent: verified.ok };
+  }
+
+  private async verifyRuleAbsent(
+    path: string,
+  ): Promise<{ ok: true; requestId: string | null } | { ok: false; error: WriterError; requestId: string | null }> {
+    let lastRequestId: string | null = null;
+    for (let attempt = 0; attempt < DELETE_VERIFY_MAX_ATTEMPTS; attempt += 1) {
+      const after = await this.arm.get(path, AZURE_SQL_FIREWALL_PROFILE.apiVersion);
+      lastRequestId = after.requestId;
+      if (!after.ok) {
+        if (after.error.code === "not_found") {
+          return { ok: true, requestId: after.requestId };
+        }
+        return { ok: false, error: after.error, requestId: after.requestId };
+      }
+      if (attempt + 1 < DELETE_VERIFY_MAX_ATTEMPTS) {
+        await this.sleep(DELETE_VERIFY_BASE_DELAY_MS * (1 << attempt));
+      }
+    }
+    return {
+      ok: false,
+      requestId: lastRequestId,
+      error: writerError({
+        code: "delete_not_verified",
+        message: "The firewall rule was still present after delete.",
+        ruleApplied: true,
+        removalVerified: false,
+      }),
+    };
   }
 
   private async readAllRules(
@@ -706,4 +762,10 @@ export class AzureSqlFirewallRuleProvider implements AzureSqlRuleProvider {
 
 export function createAzureSqlRuleProvider(options: AzureSqlRuleProviderOptions): AzureSqlRuleProvider {
   return new AzureSqlFirewallRuleProvider(options);
+}
+
+function defaultSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }

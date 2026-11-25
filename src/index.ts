@@ -73,6 +73,8 @@ export type { AzureWriterOptions } from "./azure/child-writer.js";
 export {
   AZURE_SQL_RULE_PROVIDER_ACTIONS,
   AzureSqlFirewallRuleProvider,
+  DELETE_VERIFY_BASE_DELAY_MS,
+  DELETE_VERIFY_MAX_ATTEMPTS,
   createAzureSqlRuleProvider,
 } from "./azure/sql-provider.js";
 export type {
@@ -88,7 +90,7 @@ export type {
   SqlRuleOutcome,
 } from "./azure/sql-provider.js";
 
-export { MAX_LRO_BUDGET_MS, MAX_LRO_POLLS } from "./azure/arm.js";
+export { LRO_MAX_DELAY_MS, LRO_MIN_DELAY_MS, MAX_LRO_BUDGET_MS, MAX_LRO_POLLS } from "./azure/arm.js";
 
 export { DEFAULT_HTTP_TIMEOUT_MS, createFetchTransport } from "./azure/http.js";
 export type { ArmTokenProvider, HttpTransport } from "./azure/http.js";

@@ -20,7 +20,7 @@ export interface HttpTransport {
 
 export interface ArmTokenProvider {
   /** Returns the bearer token only. Do not include the "Bearer " prefix. */
-  getToken(): Promise<string>;
+  getToken(options?: { forceRefresh?: boolean }): Promise<string>;
 }
 
 export interface FetchLike {
@@ -78,10 +78,10 @@ export function sameOriginArmUrl(candidate: string, endpoint: string): URL | nul
   if (target.username !== "" || target.password !== "") {
     return null;
   }
-  if (target.protocol !== "https:" && target.protocol !== "http:") {
+  if (base.protocol !== "https:" || target.protocol !== "https:") {
     return null;
   }
-  if (target.protocol !== base.protocol || target.host !== base.host) {
+  if (target.host !== base.host) {
     return null;
   }
   if (!target.pathname.startsWith("/subscriptions/")) {
